@@ -1,0 +1,23 @@
+{
+  "name": "mirurorpc",
+  "version": "1.0.0",
+  "description": "",
+  "homepage": "https://github.com/D4rkov/Miruro-RPC#readme",
+  "bugs": {
+    "url": "https://github.com/D4rkov/Miruro-RPC/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/D4rkov/Miruro-RPC.git"
+  },
+  "license": "MIT",
+  "author": "Darkov",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "ws": "^8.21.0"
+  }
+}
