@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      1.5.0
+// @version      1.4.0
 // @description  Sends Miruro data to the bridge.
 // @match        https://www.miruro.tv/*
 // @match        https://www.miruro.to/*
 // @match        https://www.miruro.bz/*
 // @match        https://www.miruro.ru/*
 // @match        https://www.animegg.org/*
-// @match        https://megaplay.buzz/*
+// @match        https://megaplay.buzz
+// @match        https://vivibebe.site/*
 // @grant        none
 // ==/UserScript==
 
@@ -18,6 +19,7 @@
     const IS_MIRURO = location.hostname.includes("miruro");
     const IS_ANIMEGG = location.hostname.includes("animegg");
     const IS_MEGAPLAY = location.hostname.includes("megaplay");
+    const IS_VIVIBEBE = location.hostname.includes("vivibebe");
 
     let socket;
     let started = false;
@@ -278,7 +280,7 @@
     if (IS_MIRURO) {
         connectMiruro();
     }
-    else if (IS_ANIMEGG || IS_MEGAPLAY) {
+    else if (IS_ANIMEGG || IS_MEGAPLAY || IS_VIVIBEBE) {
         connectEmbed();
     }
 })();
