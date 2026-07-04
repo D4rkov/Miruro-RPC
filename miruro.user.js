@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      1.4.0
+// @version      1.5.0
 // @description  Sends Miruro data to the bridge.
 // @match        https://www.miruro.tv/*
 // @match        https://www.miruro.to/*
@@ -244,23 +244,25 @@
                 let timer = null;
 
                 video.addEventListener("play", () => {
-                    sendPlayback();
+                    sendEmbedPlayback();
 
                     clearInterval(timer);
-                    timer = setInterval(sendPlayback, 5000);
+                    timer = setInterval(sendEmbedPlayback, 5000);
                 });
 
                 video.addEventListener("pause", () => {
                     clearInterval(timer);
-                    sendPlayback();
+                    sendEmbedPlayback();
                 });
 
                 video.addEventListener("seeked", () => {
-                    sendPlayback();
+                    sendEmbedPlayback();
                 });
-                video.addEventListener("loadedmetadata", sendPlayback);
+                video.addEventListener("loadedmetadata", () => {
+                    sendEmbedPlayback();
+                });
 
-                sendPlayback();
+                sendEmbedPlayback();
             }, 100);
         });
 

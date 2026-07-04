@@ -1,125 +1,88 @@
 # MiruroRPC
 
-Discord Rich Presence for **Miruro** with support for all playback providers.
+Discord Rich Presence for Miruro.
 
-## ✨ Features
+Displays what you're watching on Discord, including:
 
-- 🎬 Displays the anime you're watching in Discord
-- 📺 Episode number and title
-- ⏱️ Live playback progress
+- 📺 Anime title
+- 🎬 Episode number & title
+- ▶️ Play / ⏸ Pause status
+- ⏱️ Live playback progress & timestamps
 - 🖼️ Anime cover artwork
+- 🔍 Browsing status when searching
 - 🔗 "Watch on Miruro" button
-- 🔄 Automatic reconnecting
-
-## 📦 Requirements
-
-- BetterDiscord
-- Tampermonkey
-- Node.js
-
-# 🚀 Installation
-
-## 1. Download the repository
-
-Download or clone this repository to a folder on your computer.
+- 🧹 Clears Rich Presence when all Miruro tabs are closed
 
 ---
 
-## 2. Install the BetterDiscord plugin
+## Requirements
 
-Copy:
-
-```
-MiruroRPC.plugin.js
-```
-
-into your BetterDiscord plugins folder.
-
-Enable the plugin from **Discord → Settings → BetterDiscord → Plugins**.
+- Node.js 18+
+- Discord Desktop
+- Tampermonkey (or another userscript manager)
 
 ---
 
-## 3. Install the userscript
+## Installation
 
-Open:
-
-```
-Miruro-RPC.user.js
-```
-
-with Tampermonkey
-
----
-
-## 4. Install the bridge dependency
-
-Open a terminal (PowerShell, Command Prompt or Terminal) **inside the folder containing `bridge.js`**.
-
-Run:
+### 1. Clone the repository
 
 ```bash
-npm install ws
+git clone https://github.com/D4rkov/MiruroRPC.git
+cd MiruroRPC
 ```
 
-This only needs to be done once.
+### 2. Install dependencies
 
----
-
-## 5. Start the bridge
-
-From the same terminal, run:
+Run this inside the project folder:
 
 ```bash
-node bridge.js
+npm install
+```
+
+This installs the required packages (`discord-rpc` and `ws`).
+
+### 3. Start MiruroRPC
+
+Start the application:
+
+```bash
+node MiruroRPC.js
 ```
 
 You should see:
 
 ```
-Bridge listening on ws://127.0.0.1:3847
+MiruroRPC listening on ws://127.0.0.1:3847
+Discord RPC connected.
 ```
 
-Keep this terminal window open while using MiruroRPC.
+Leave this terminal window open while using Miruro.
 
 ---
 
-## 6. Watch anime
+## Userscript
 
-Open Miruro, start watching an anime, and your Discord Rich Presence will update automatically.
+1. Install Tampermonkey.
+2. Create a new userscript.
+3. Paste the contents of `MiruroRPC.user.js`.
+4. Save.
 
-> **Note:** The bridge must be running for Rich Presence to work.
+The userscript will automatically connect to the local MiruroRPC application.
 
-## ❓ Troubleshooting
+---
 
-### `node` is not recognized
+## Updating
 
-Install Node.js and restart your terminal.
-
-### `Cannot find module 'ws'`
-
-Run:
+After pulling new changes:
 
 ```bash
-npm install ws
+git pull
+npm install
 ```
 
-in the folder containing `bridge.js`.
+---
 
-### Rich Presence isn't updating
+## License
 
-- Make sure the BetterDiscord plugin is enabled.
-- Make sure the userscript is installed and enabled.
-- Verify `bridge.js` is running.
-- Refresh the Miruro page.
-
-## 📁 Files
-
-| File | Purpose |
-|------|---------|
-| `MiruroRPC.plugin.js` | BetterDiscord plugin |
-| `Miruro-RPC.user.js` | Collects playback information from Miruro |
-| `bridge.js` | Local WebSocket bridge between the userscript and Discord |
-
-## ❤️ Credits
-
-Created by **Darkov**.
+MIT
