@@ -1,6 +1,6 @@
 # MiruroRPC
 
-Discord Rich Presence for Miruro.
+Discord Rich Presence for Miruro using a local bridge between a userscript and Discord RPC.
 
 Displays what you're watching on Discord, including:
 
@@ -69,6 +69,30 @@ Leave this terminal window open while using Miruro.
 4. Save.
 
 The userscript will automatically connect to the local MiruroRPC application.
+
+---
+
+## FAQ
+
+### Why does the userscript use `@match *://*/*`?
+
+Miruro supports third-party embed providers. Depending on the anime (or even the episode), the selected server (e.g. Bun) may use a different provider behind the scenes.
+
+Because of the browser's **Same-Origin Policy**, a userscript running only on `miruro.tv` cannot access or control a video hosted inside a cross-origin iframe. To read playback information (play/pause state, timestamps, progress, etc.), the userscript must also be able to run on the domain that's actually hosting the video.
+
+Maintaining a whitelist of every possible provider isn't practical, as providers can be added, removed, or changed at any time. Using:
+
+```js
+// @match *://*/*
+```
+
+makes the userscript provider-agnostic and future-proof.
+
+**This does not mean the script runs on every website in practice.** Although it is injected on every page, it immediately exits unless the page is either:
+- A Miruro page, or
+- A video embed loaded by Miruro.
+
+On all other websites, no WebSocket connection is opened, no data is collected, and no actions are performed.
 
 ---
 
