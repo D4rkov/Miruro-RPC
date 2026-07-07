@@ -7,9 +7,10 @@ const APPLICATION_ID = "1521597072434794527";
 const wss = new WebSocket.Server({ port: PORT });
 const clients = new Set();
 const DEBUG = process.argv.includes("--debug");
+const presences = new Map();
+const playbacks = new Map();
 
-let presence = null;
-let playback = null;
+let ownerId = null;
 let browseStart = null;
 let dotFrame = 0;
 let lastActivity = null;
@@ -32,6 +33,32 @@ function info(...args) {
     console.log(...args);
 }
 
+function getPresence() {
+    return presences.get(ownerId);
+}
+
+function getPlayback() {
+    return playbacks.get(ownerId);
+}
+
+function setPresence(data) {
+    presences.set(data.id, data);
+}
+
+function setPlayback(data) {
+    playbacks.set(data.id, data);
+}
+
+function clearTab(id) {
+    presences.delete(id);
+    playbacks.delete(id);
+}
+
+function clearAllTabs() {
+    presences.clear();
+    playbacks.clear();
+}
+
 function scheduleReconnect() {
 
     if (reconnectTimer)
@@ -42,6 +69,17 @@ function scheduleReconnect() {
         debug("Reconnecting to Discord...");
         connectRPC();
     }, 2000);
+
+}
+
+function disconnectRPC(message) {
+
+    rpcReady = false;
+
+    if (message)
+        debug(message);
+
+    scheduleReconnect();
 
 }
 
@@ -67,26 +105,23 @@ function connectRPC() {
     });
 
     rpc.on("disconnected", () => {
-        rpcReady = false;
-        debug("Discord RPC disconnected.");
-        scheduleReconnect();
+        disconnectRPC("Discord RPC disconnected.");
     });
 
     rpc.on("error", err => {
-        rpcReady = false;
-        debug("RPC error:", err.message);
+        debug(`RPC error: ${err.message}`);
     });
 
     rpc.login({
         clientId: APPLICATION_ID
     }).catch(err => {
 
-        rpcReady = false;
+        disconnectRPC(
+            err.message !== "Could not connect"
+                ? `RPC login failed: ${err.message}`
+                : null
+        );
 
-        if (err.message !== "Could not connect")
-            debug("RPC login failed:", err.message);
-
-        scheduleReconnect();
     });
 
 }
@@ -105,30 +140,30 @@ wss.on("connection", (ws) => {
 
             if (data.type === "hello") {
                 ws.client = data.client;
+                ws.id = data.id;
                 info(`${ws.client} connected.`);
                 return;
             }
 
             switch (data.type) {
 
+                case "claim":
+                    handleClaimMessage(data);
+                    break;
+
                 case "browse":
-                    presence = null;
-                    playback = null;
-                    handleBrowse();
+                    handleBrowseMessage(data);
                     break;
 
                 case "presence":
-                    presence = data;
-                    updateActivity();
+                    handlePresenceMessage(data);
                     break;
 
                 case "playback":
-                    playback = data;
-                    updateActivity();
+                    handlePlaybackMessage(data);
                     break;
 
             }
-
         } catch (err) {
             console.error("Failed to process message:", err);
         }
@@ -137,54 +172,87 @@ wss.on("connection", (ws) => {
 
     ws.on("close", () => {
         clients.delete(ws);
+
         info(`${ws.client ?? "Unknown"} disconnected.`);
+
+        if (ws.id) {
+            clearTab(ws.id);
+
+            if (ownerId === ws.id) {
+                ownerId = null;
+                updateActivity();
+            }
+        }
+
         if (clients.size === 0) {
-
-            presence = null;
-            playback = null;
-
+            clearAllTabs();
+            ownerId = null;
             clearActivity();
-
         }
     });
 
-    ws.on("error", (err) => {
-        console.error("Client error:", err.message);
-    });
-
 });
+
+function handleClaimMessage(data) {
+    ownerId = data.id;
+    updateActivity();
+}
+
+function handleBrowseMessage(data) {
+    if (data.id !== ownerId)
+        return;
+
+    clearTab(data.id);
+    updateActivity();
+}
+
+function handlePresenceMessage(data) {
+    setPresence(data);
+    updateActivity();
+}
+
+function handlePlaybackMessage(data) {
+    setPlayback(data);
+    updateActivity();
+}
+
+function mergePlayback(data, playback) {
+
+    const hasNativePlayback =
+        data.currentTime != null &&
+        data.duration != null;
+
+    if (hasNativePlayback)
+        return true;
+
+    if (!playback)
+        return false;
+
+    data.currentTime = playback.currentTime;
+    data.duration = playback.duration;
+    data.paused = playback.paused;
+
+    return true;
+
+}
 
 function updateActivity() {
 
     if (!rpcReady)
         return;
 
+    const presence = getPresence();
+    const playback = getPlayback();
+
     if (!presence) {
         handleBrowse();
         return;
     }
 
-    let data = { ...presence };
+    const data = { ...presence };
 
-    const hasNativePlayback =
-        data.currentTime != null &&
-        data.duration != null;
-
-    if (!hasNativePlayback) {
-
-        if (!playback)
-            return;
-
-        data.currentTime = playback.currentTime;
-        data.duration = playback.duration;
-        data.paused = playback.paused;
-
-    } else {
-
-        // Native playback takes priority.
-        playback = null;
-
-    }
+    if (!mergePlayback(data, playback))
+        return;
 
     handlePresence(data);
 
@@ -215,9 +283,9 @@ function handleBrowse() {
 
 }
 
-function handlePresence(data) {
-    browseStart = null;
-    const activity = {
+function createActivity(data) {
+
+    return {
 
         application_id: APPLICATION_ID,
         name: "Anime on Miruro! ッ",
@@ -227,14 +295,16 @@ function handlePresence(data) {
             : `EP. ${data.episode}`,
         type: 3,
 
-        buttons: [
-            {
-                label: "Watch on Miruro! ッ",
-                url: data.url
-            }
-        ]
+        buttons: [{
+            label: "Watch on Miruro! ッ",
+            url: data.url
+        }]
 
     };
+
+}
+
+function applyAssets(activity, data) {
 
     activity.assets = {
 
@@ -244,6 +314,10 @@ function handlePresence(data) {
         small_text: "Miruro"
 
     };
+
+}
+
+function applyTimestamps(activity, data) {
 
     if (data.paused) {
 
@@ -256,21 +330,29 @@ function handlePresence(data) {
             end: now
         };
 
-    } else {
-
-        activity.state = `▶ ${activity.state}`;
-
-        const now = Date.now();
-
-        activity.timestamps = {
-            start: Math.floor((now - data.currentTime * 1000) / 1000),
-            end: Math.floor((now + (data.duration - data.currentTime) * 1000) / 1000)
-        };
-
+        return;
     }
 
-    setActivity(activity);
+    activity.state = `▶ ${activity.state}`;
 
+    const now = Date.now();
+
+    activity.timestamps = {
+        start: Math.floor((now - data.currentTime * 1000) / 1000),
+        end: Math.floor((now + (data.duration - data.currentTime) * 1000) / 1000)
+    };
+
+}
+
+function handlePresence(data) {
+    browseStart = null;
+
+    const activity = createActivity(data);
+
+    applyAssets(activity, data);
+    applyTimestamps(activity, data);
+
+    setActivity(activity);
 }
 
 function setActivity(activity) {
