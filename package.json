@@ -10,7 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/D4rkov/Miruro-RPC.git"
   },
-  "license": "GPL-3.0"
+  "license": "GPL-3.0",
   "author": "Darkov",
   "type": "commonjs",
   "main": "index.js",
