@@ -80,8 +80,9 @@ Miruro supports third-party embed providers. Depending on the anime (or even the
 
 Because of the browser's **Same-Origin Policy**, a userscript running only on `miruro.tv` cannot access or control a video hosted inside a cross-origin iframe. To read playback information (play/pause state, timestamps, progress, etc.), the userscript must also be able to run on the domain that's actually hosting the video.
 
-Maintaining a whitelist of every possible provider isn't practical, as providers can be added, removed, or changed at any time. Using:
+Maintaining a whitelist of every possible provider isn't practical, as providers can be added, removed, or changed at any time. 
 
+Using:
 ```js
 // @match *://*/*
 ```
