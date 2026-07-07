@@ -142,7 +142,9 @@
             clearInterval(wait);
 
             attachVideoListeners();
-            sendPresence();
+
+            if (!document.hidden)
+                claim();
         }, 50);
     }
 

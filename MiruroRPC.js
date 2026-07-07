@@ -170,10 +170,19 @@ wss.on("connection", (ws) => {
         info(`${ws.client ?? "Unknown"} disconnected.`);
 
         if (ws.id) {
-            clearTab(ws.id);
 
-            if (ownerId === ws.id) {
-                ownerId = null;
+            if (ws.client === "Miruro") {
+                presences.delete(ws.id);
+
+                if (ownerId === ws.id) {
+                    ownerId = null;
+                    updateActivity();
+                }
+            }
+
+            if (ws.client === "Embed") {
+                playbacks.delete(ws.id);
+
                 updateActivity();
             }
         }
