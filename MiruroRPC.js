@@ -6,7 +6,7 @@ const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const wss = new WebSocket.Server({ port: PORT });
 const clients = new Set();
-const DEBUG = false;
+const DEBUG = process.argv.includes("--debug");
 
 let presence = null;
 let playback = null;
@@ -73,14 +73,19 @@ function connectRPC() {
     });
 
     rpc.on("error", err => {
+        rpcReady = false;
         debug("RPC error:", err.message);
     });
 
     rpc.login({
         clientId: APPLICATION_ID
     }).catch(err => {
+
+        rpcReady = false;
+
         if (err.message !== "Could not connect")
             debug("RPC login failed:", err.message);
+
         scheduleReconnect();
     });
 
@@ -270,7 +275,7 @@ function handlePresence(data) {
 
 function setActivity(activity) {
 
-    if (!rpc?.transport)
+    if (!rpcReady || !rpc?.transport?.socket)
         return;
 
     const key = JSON.stringify({

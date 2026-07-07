@@ -3,13 +3,8 @@
 // @namespace    https://github.com/D4rkov
 // @version      1.4.0
 // @description  Sends Miruro data to the bridge.
-// @match        https://www.miruro.tv/*
-// @match        https://www.miruro.to/*
-// @match        https://www.miruro.bz/*
-// @match        https://www.miruro.ru/*
-// @match        https://www.animegg.org/*
-// @match        https://megaplay.buzz
-// @match        https://vivibebe.site/*
+// @match        *://*/*
+// @run-at       document-start
 // @grant        none
 // ==/UserScript==
 
@@ -17,14 +12,15 @@
     "use strict";
 
     const IS_MIRURO = location.hostname.includes("miruro");
-    const IS_ANIMEGG = location.hostname.includes("animegg");
-    const IS_MEGAPLAY = location.hostname.includes("megaplay");
-    const IS_VIVIBEBE = location.hostname.includes("vivibebe");
+
+    const IS_MIRURO_EMBED =
+        !IS_MIRURO &&
+        document.referrer &&
+        new URL(document.referrer).hostname.includes("miruro");
 
     let socket;
     let started = false;
     let attachedVideo = null;
-    let nunDuration = null;
 
     function getTitle() {
         return document.querySelector("h1")?.textContent.trim() ?? null;
@@ -86,20 +82,6 @@
             duration: video?.duration,
             paused: video?.paused
         }));
-    }
-
-    function sendPlayback(currentTime, paused) {
-
-        if (!socket || socket.readyState !== WebSocket.OPEN)
-            return;
-
-        socket.send(JSON.stringify({
-            type: "playback",
-            currentTime,
-            duration: nunDuration,
-            paused
-        }));
-
     }
 
     function attachVideoListeners() {
@@ -180,36 +162,8 @@
             socket.close();
         });
     }
-    window.addEventListener("message", e => {
-        if (!IS_MIRURO)
-            return;
 
-        if (e.origin !== "https://ok.ru")
-            return;
-
-        switch (e.data.event) {
-
-            case "timeupdate":
-                nunDuration = e.data.duration;
-                sendPlayback(e.data.time, false);
-                break;
-
-            case "paused":
-                sendPlayback(e.data.time, true);
-                break;
-
-            case "resumed":
-                sendPlayback(e.data.time, false);
-                break;
-
-            case "rewound":
-                sendPlayback(e.data.time, false);
-                break;
-
-        }
-    });
-
-    function connectEmbed() {
+    function connectPlayback() {
 
         socket = new WebSocket("ws://127.0.0.1:3847");
 
@@ -228,7 +182,7 @@
 
                 clearInterval(wait);
 
-                function sendEmbedPlayback() {
+                function sendPlayback() {
 
                     if (socket.readyState !== WebSocket.OPEN) {
                         return;
@@ -246,30 +200,30 @@
                 let timer = null;
 
                 video.addEventListener("play", () => {
-                    sendEmbedPlayback();
+                    sendPlayback();
 
                     clearInterval(timer);
-                    timer = setInterval(sendEmbedPlayback, 5000);
+                    timer = setInterval(sendPlayback, 5000);
                 });
 
                 video.addEventListener("pause", () => {
                     clearInterval(timer);
-                    sendEmbedPlayback();
+                    sendPlayback();
                 });
 
                 video.addEventListener("seeked", () => {
-                    sendEmbedPlayback();
+                    sendPlayback();
                 });
                 video.addEventListener("loadedmetadata", () => {
-                    sendEmbedPlayback();
+                    sendPlayback();
                 });
 
-                sendEmbedPlayback();
+                sendPlayback();
             }, 100);
         });
 
         socket.addEventListener("close", () => {
-            setTimeout(connectEmbed, 2000);
+            setTimeout(connectPlayback, 2000);
         });
 
         socket.addEventListener("error", () => {
@@ -280,7 +234,7 @@
     if (IS_MIRURO) {
         connectMiruro();
     }
-    else if (IS_ANIMEGG || IS_MEGAPLAY || IS_VIVIBEBE) {
-        connectEmbed();
+    else if (IS_MIRURO_EMBED) {
+        connectPlayback();
     }
 })();
