@@ -115,13 +115,7 @@ function connectRPC() {
     rpc.login({
         clientId: APPLICATION_ID
     }).catch(err => {
-
-        disconnectRPC(
-            err.message !== "Could not connect"
-                ? `RPC login failed: ${err.message}`
-                : null
-        );
-
+        disconnectRPC(`RPC login failed: ${err.message}`);
     });
 
 }
