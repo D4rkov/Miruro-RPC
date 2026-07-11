@@ -99,12 +99,13 @@ On all other websites, no WebSocket connection is opened, no data is collected, 
 
 ## Updating
 
-After pulling new changes:
+Pull the new changes (if u used git, if not just download the repo)
 
 ```bash
 git pull
 npm install
 ```
+also don't forget to copy the updated userscript code and add it to ur userscript manager.
 
 ---
 
