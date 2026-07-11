@@ -219,16 +219,21 @@ function handlePlaybackMessage(data) {
     updateActivity();
 }
 
+function hasValidPlayback(data) {
+    return (
+        Number.isFinite(data.currentTime) &&
+        Number.isFinite(data.duration) &&
+        data.duration > 0 &&
+        data.currentTime >= 0
+    );
+}
+
 function mergePlayback(data, playback) {
 
-    const hasNativePlayback =
-        data.currentTime != null &&
-        data.duration != null;
-
-    if (hasNativePlayback)
+    if (hasValidPlayback(data))
         return true;
 
-    if (!playback)
+    if (!playback || !hasValidPlayback(playback))
         return false;
 
     data.currentTime = playback.currentTime;
@@ -254,8 +259,7 @@ function updateActivity() {
 
     const data = { ...presence };
 
-    if (!mergePlayback(data, playback))
-        return;
+    mergePlayback(data, playback);
 
     handlePresence(data);
 
@@ -288,14 +292,35 @@ function handleBrowse() {
 
 function createActivity(data) {
 
+    const details = String(data.title ?? "Unknown Anime")
+        .trim()
+        .slice(0, 128);
+
+    const baseState = `EP. ${data.episode}`;
+
+    let state = baseState;
+
+    if (data.episodeTitle) {
+
+        const prefix = `${baseState}: "`;
+        const suffix = `"`;
+        const maxLength = 128 - prefix.length - suffix.length;
+
+        const episodeTitle = String(data.episodeTitle)
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, maxLength);
+
+        if (episodeTitle)
+            state = `${prefix}${episodeTitle}${suffix}`;
+    }
+
     return {
 
         application_id: APPLICATION_ID,
         name: "Anime on Miruro! ッ",
-        details: data.title,
-        state: data.episodeTitle
-            ? `EP. ${data.episode}: "${data.episodeTitle}"`
-            : `EP. ${data.episode}`,
+        details,
+        state,
         type: 3,
 
         buttons: [{
@@ -322,6 +347,11 @@ function applyAssets(activity, data) {
 
 function applyTimestamps(activity, data) {
 
+    const currentTime = Math.max(
+        0,
+        Math.min(data.currentTime, data.duration)
+    );
+
     if (data.paused) {
 
         activity.state = `❚❚ ${activity.state}`;
@@ -341,21 +371,27 @@ function applyTimestamps(activity, data) {
     const now = Date.now();
 
     activity.timestamps = {
-        start: Math.floor((now - data.currentTime * 1000) / 1000),
-        end: Math.floor((now + (data.duration - data.currentTime) * 1000) / 1000)
+        start: Math.floor((now - currentTime * 1000) / 1000),
+        end: Math.floor(
+            (now + (data.duration - currentTime) * 1000) / 1000
+        )
     };
 
 }
 
 function handlePresence(data) {
+
     browseStart = null;
 
     const activity = createActivity(data);
 
     applyAssets(activity, data);
-    applyTimestamps(activity, data);
+
+    if (hasValidPlayback(data))
+        applyTimestamps(activity, data);
 
     setActivity(activity);
+
 }
 
 function setActivity(activity) {

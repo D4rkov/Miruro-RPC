@@ -24,10 +24,7 @@
         "loadedmetadata"
     ];
 
-    const IS_MIRURO_EMBED =
-        !IS_MIRURO &&
-        document.referrer &&
-        new URL(document.referrer).hostname.includes("miruro");
+    const IS_FRAME = window !== window.top;
 
     let TAB_ID = crypto.randomUUID();
     let socket;
@@ -35,25 +32,76 @@
     let attachedVideo = null;
 
     function initTabId() {
+
+        const pendingChildren = new Set();
+
         window.addEventListener("message", e => {
+
             if (e.data === "miruro-rpc-id-request") {
-                e.source?.postMessage({
-                    type: "miruro-rpc-id",
-                    id: TAB_ID
-                }, "*");
+
+                if (IS_MIRURO) {
+
+                    e.source?.postMessage({
+                        type: "miruro-rpc-id",
+                        id: TAB_ID
+                    }, "*");
+
+                    return;
+                }
+
+                pendingChildren.add(e.source);
+
+                window.parent.postMessage(
+                    "miruro-rpc-id-request",
+                    "*"
+                );
+
+                return;
             }
-        });
 
-        if (!IS_MIRURO_EMBED)
-            return;
-
-        window.parent.postMessage("miruro-rpc-id-request", "*");
-
-        window.addEventListener("message", e => {
             if (e.data?.type === "miruro-rpc-id") {
+
                 TAB_ID = e.data.id;
+
+                for (const child of pendingChildren) {
+                    child?.postMessage({
+                        type: "miruro-rpc-id",
+                        id: TAB_ID
+                    }, "*");
+                }
+
+                pendingChildren.clear();
+
+                if (!IS_MIRURO && !initialized) {
+                    initialized = true;
+                    connectPlayback();
+                }
             }
+
         });
+
+        if (!IS_MIRURO) {
+            window.parent.postMessage(
+                "miruro-rpc-id-request",
+                "*"
+            );
+        }
+    }
+
+    function getOKPlayer() {
+
+        if (
+            !location.hostname.endsWith("ok.ru") ||
+            !window.OneVideoPlayer?.getPlayers
+        ) {
+            return null;
+        }
+
+        try {
+            return window.OneVideoPlayer.getPlayers()[0] ?? null;
+        } catch {
+            return null;
+        }
     }
 
     function getTitle() {
@@ -66,30 +114,27 @@
             ?.src ?? null;
     }
 
-    function getEpisodeTitle() {
-        const text = document.querySelector('[class*="_dataWrapper_"]')?.textContent;
+    function getEpisodeTitle(episode) {
 
-        if (!text)
-            return null;
+        const titles = document.querySelectorAll(
+            '[class*="_episodeNumber_"]'
+        );
 
-        return text
-            .split("AUDIO")[0]
-            .replace(/^\d+\.\s*(?:EP|Episode)\.?\s*\d+\s*[:.\-–—·]?\s*/i, "")
-            .replace(/^\d+\.\s*/, "")
-            .trim();
+        const title = titles[episode - 1]
+            ?.textContent
+            ?.trim();
+
+        return title || null;
     }
 
     function sendPresence() {
 
+        if (!location.pathname.startsWith("/watch/"))
+            return;
+
         const title = getTitle();
         const cover = getCover();
         const video = document.querySelector("video");
-        const isWatchPage = location.pathname.startsWith("/watch/");
-
-        if (!isWatchPage) {
-            send("browse");
-            return;
-        }
 
         if (!title || !cover)
             return;
@@ -98,18 +143,25 @@
         const episode = Number(url.searchParams.get("ep")) || 1;
         url.search = "";
 
-        // Button always opens the anime page
         send("presence", {
             title,
             episode,
             totalEpisodes: document.querySelectorAll('[class*="_episodeNumber_"]').length,
-            episodeTitle: getEpisodeTitle(),
+            episodeTitle: getEpisodeTitle(episode),
             cover,
             url: url.toString(),
             currentTime: video?.currentTime,
             duration: video?.duration,
             paused: video?.paused
         });
+    }
+
+    function updatePageState() {
+        if (location.pathname.startsWith("/watch/")) {
+            sendPresence();
+        } else {
+            send("browse");
+        }
     }
 
     function attachVideoListeners() {
@@ -131,17 +183,26 @@
 
         attachedVideo = null;
 
-        const previousTitle = getTitle();
+        updatePageState();
+
+        if (!location.pathname.startsWith("/watch/")) {
+            if (!document.hidden)
+                claim();
+
+            return;
+        }
 
         const wait = setInterval(() => {
-            const currentTitle = getTitle();
+            const title = getTitle();
+            const cover = getCover();
 
-            if (!currentTitle || currentTitle === previousTitle)
+            if (!title || !cover)
                 return;
 
             clearInterval(wait);
 
             attachVideoListeners();
+            sendPresence();
 
             if (!document.hidden)
                 claim();
@@ -172,6 +233,10 @@
         return true;
     }
 
+    function debugEmbed(...args) {
+        console.debug("[MiruroRPC]", ...args);
+    }
+
     function claim() {
         if (send("claim"))
             sendPresence();
@@ -198,6 +263,7 @@
 
         connect("Miruro", connectMiruro, () => {
 
+            updatePageState();
             attachVideoListeners();
 
             if (!document.hidden)
@@ -208,7 +274,10 @@
 
             initialized = true;
 
-            setInterval(sendPresence, PRESENCE_INTERVAL);
+            setInterval(() => {
+                if (location.pathname.startsWith("/watch/"))
+                    sendPresence();
+            }, PRESENCE_INTERVAL);
 
             const originalPushState = history.pushState;
             history.pushState = function (...args) {
@@ -232,40 +301,140 @@
 
         connect("Embed", connectPlayback, () => {
 
-            const wait = setInterval(() => {
-                const video = document.querySelector("video");
+            let currentMedia = null;
+            let currentType = null;
 
-                if (!video)
-                    return;
+            function getNativeVideo() {
+                return document.querySelector("video");
+            }
 
-                clearInterval(wait);
+            function getOKPlayer() {
 
-                function sendPlayback() {
-                    send("playback", {
-                        currentTime: video.currentTime,
-                        duration: video.duration,
-                        paused: video.paused
-                    });
+                if (
+                    !location.hostname.endsWith("ok.ru") ||
+                    !window.OneVideoPlayer?.getPlayers
+                ) {
+                    return null;
                 }
 
-                let timer = null;
+                try {
+                    return window.OneVideoPlayer.getPlayers()[0] ?? null;
+                } catch {
+                    return null;
+                }
+            }
 
-                video.addEventListener("play", () => {
-                    sendPlayback();
-                    clearInterval(timer);
-                    timer = setInterval(sendPlayback, PRESENCE_INTERVAL);
+            function getPlayback() {
+
+                if (!currentMedia)
+                    return null;
+
+                try {
+
+                    return {
+                        currentTime: Number(currentMedia.currentTime),
+                        duration: Number(currentMedia.duration),
+                        paused: Boolean(currentMedia.paused)
+                    };
+
+                } catch {
+                    return null;
+                }
+            }
+
+            function sendPlayback() {
+
+                const playback = getPlayback();
+
+                if (!playback)
+                    return;
+
+                send("playback", {
+                    currentTime: Number.isFinite(playback.currentTime)
+                        ? playback.currentTime
+                        : 0,
+                    duration: Number.isFinite(playback.duration)
+                        ? playback.duration
+                        : null,
+                    paused: playback.paused
                 });
+            }
 
-                video.addEventListener("pause", () => {
-                    clearInterval(timer);
-                    sendPlayback();
-                });
+            function attachNativeVideo(video) {
 
-                video.addEventListener("seeked", sendPlayback);
-                video.addEventListener("loadedmetadata", sendPlayback);
+                currentMedia = video;
+                currentType = "native";
+
+                VIDEO_EVENTS.forEach(event =>
+                    video.addEventListener(
+                        event,
+                        sendPlayback
+                    )
+                );
 
                 sendPlayback();
-            }, VIDEO_WAIT_INTERVAL);
+            }
+
+            function attachOKPlayer(player) {
+
+                currentMedia = player;
+                currentType = "ok";
+
+                sendPlayback();
+            }
+
+            function findPlayer() {
+
+                const video = getNativeVideo();
+
+                if (video) {
+
+                    if (
+                        currentMedia !== video ||
+                        currentType !== "native"
+                    ) {
+                        attachNativeVideo(video);
+                    }
+
+                    return;
+                }
+
+                const okPlayer = getOKPlayer();
+
+                if (okPlayer) {
+
+                    if (
+                        currentMedia !== okPlayer ||
+                        currentType !== "ok"
+                    ) {
+                        attachOKPlayer(okPlayer);
+                    }
+
+                    return;
+                }
+
+                currentMedia = null;
+                currentType = null;
+            }
+
+            findPlayer();
+
+            const playbackTimer = setInterval(() => {
+                findPlayer();
+                sendPlayback();
+            }, 1000);
+
+            const observer = new MutationObserver(findPlayer);
+
+            observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+
+            socket.addEventListener("close", () => {
+                clearInterval(playbackTimer);
+                observer.disconnect();
+            });
 
         });
 
@@ -275,8 +444,5 @@
 
     if (IS_MIRURO) {
         connectMiruro();
-    }
-    else if (IS_MIRURO_EMBED) {
-        connectPlayback();
     }
 })();
