@@ -31,6 +31,8 @@ Displays what you're watching on Discord, including:
 git clone https://github.com/D4rkov/MiruroRPC.git
 cd MiruroRPC
 ```
+OR
+Download it as .zip
 
 ### 2. Install dependencies
 
