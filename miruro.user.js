@@ -1,11 +1,15 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      1.4.0
-// @description  Sends Miruro data to the bridge.
+// @version      2.1.4
+// @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
+// @author       Darkov
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
+// @updateURL    https://raw.githubusercontent.com/D4rkov/Miruro-RPC/main/miruro.user.js
+// @downloadURL  https://raw.githubusercontent.com/D4rkov/Miruro-RPC/main/miruro.user.js
+// @supportURL   https://github.com/D4rkov/Miruro-RPC/issues
 // ==/UserScript==
 
 (() => {
@@ -13,203 +17,70 @@
 
     const PORT = 3847;
     const BRIDGE_URL = `ws://127.0.0.1:${PORT}`;
-    const IS_MIRURO = location.hostname.includes("miruro");
-    const PRESENCE_INTERVAL = 5000;
-    const VIDEO_WAIT_INTERVAL = 100;
-
-    const VIDEO_EVENTS = [
-        "play",
-        "pause",
-        "seeked",
-        "loadedmetadata"
-    ];
-
+    const IS_MIRURO = /(^|\.)miruro\./i.test(location.hostname);
     const IS_FRAME = window !== window.top;
+    const PRESENCE_MS = 4000;
+    const PLAYBACK_MS = 1000;
 
-    let TAB_ID = crypto.randomUUID();
-    let socket;
-    let initialized = false;
-    let attachedVideo = null;
+    let tabId = crypto.randomUUID();
+    let socket = null;
+    let reconnectTimer = null;
+    let miruroReady = false;
+    let embedReady = false;
 
-    function initTabId() {
+    // ── messaging / tab identity (Miruro ↔ embed iframes) ───────────────
 
-        const pendingChildren = new Set();
+    const pendingChildren = new Set();
 
-        window.addEventListener("message", e => {
-
-            if (e.data === "miruro-rpc-id-request") {
-
-                if (IS_MIRURO) {
-
-                    e.source?.postMessage({
-                        type: "miruro-rpc-id",
-                        id: TAB_ID
-                    }, "*");
-
-                    return;
-                }
-
-                pendingChildren.add(e.source);
-
-                window.parent.postMessage(
-                    "miruro-rpc-id-request",
-                    "*"
-                );
-
+    window.addEventListener("message", (event) => {
+        if (event.data === "miruro-rpc-id-request") {
+            if (IS_MIRURO) {
+                event.source?.postMessage({ type: "miruro-rpc-id", id: tabId }, "*");
                 return;
             }
 
-            if (e.data?.type === "miruro-rpc-id") {
-
-                TAB_ID = e.data.id;
-
-                for (const child of pendingChildren) {
-                    child?.postMessage({
-                        type: "miruro-rpc-id",
-                        id: TAB_ID
-                    }, "*");
-                }
-
-                pendingChildren.clear();
-
-                if (!IS_MIRURO && !initialized) {
-                    initialized = true;
-                    connectPlayback();
-                }
-            }
-
-        });
-
-        if (!IS_MIRURO) {
-            window.parent.postMessage(
-                "miruro-rpc-id-request",
-                "*"
-            );
+            pendingChildren.add(event.source);
+            window.parent.postMessage("miruro-rpc-id-request", "*");
+            return;
         }
+
+        if (event.data?.type !== "miruro-rpc-id")
+            return;
+
+        tabId = event.data.id;
+
+        for (const child of pendingChildren) {
+            child?.postMessage({ type: "miruro-rpc-id", id: tabId }, "*");
+        }
+        pendingChildren.clear();
+
+        if (!IS_MIRURO && !embedReady)
+            startEmbedClient();
+    });
+
+    if (!IS_MIRURO)
+        window.parent.postMessage("miruro-rpc-id-request", "*");
+
+    // ── bridge ─────────────────────────────────────────────────────────
+
+    function send(type, data = {}) {
+        if (socket?.readyState !== WebSocket.OPEN)
+            return false;
+
+        socket.send(JSON.stringify({ type, id: tabId, ...data }));
+        return true;
     }
 
-    function getOKPlayer() {
-
-        if (
-            !location.hostname.endsWith("ok.ru") ||
-            !window.OneVideoPlayer?.getPlayers
-        ) {
-            return null;
+    function connect(client, onOpen) {
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
         }
 
         try {
-            return window.OneVideoPlayer.getPlayers()[0] ?? null;
-        } catch {
-            return null;
-        }
-    }
+            socket?.close();
+        } catch { /* ignore */ }
 
-    function getTitle() {
-        return document.querySelector("h1")?.textContent.trim() ?? null;
-    }
-
-    function getCover() {
-        return [...document.querySelectorAll("img")]
-            .find(img => img.src.includes("/media/anime/cover/"))
-            ?.src ?? null;
-    }
-
-    function getEpisodeTitle(episode) {
-
-        const titles = document.querySelectorAll(
-            '[class*="_episodeNumber_"]'
-        );
-
-        const title = titles[episode - 1]
-            ?.textContent
-            ?.trim();
-
-        return title || null;
-    }
-
-    function sendPresence() {
-
-        if (!location.pathname.startsWith("/watch/"))
-            return;
-
-        const title = getTitle();
-        const cover = getCover();
-        const video = document.querySelector("video");
-
-        if (!title || !cover)
-            return;
-
-        const url = new URL(location.href);
-        const episode = Number(url.searchParams.get("ep")) || 1;
-        url.search = "";
-
-        send("presence", {
-            title,
-            episode,
-            totalEpisodes: document.querySelectorAll('[class*="_episodeNumber_"]').length,
-            episodeTitle: getEpisodeTitle(episode),
-            cover,
-            url: url.toString(),
-            currentTime: video?.currentTime,
-            duration: video?.duration,
-            paused: video?.paused
-        });
-    }
-
-    function updatePageState() {
-        if (location.pathname.startsWith("/watch/")) {
-            sendPresence();
-        } else {
-            send("browse");
-        }
-    }
-
-    function attachVideoListeners() {
-        const video = document.querySelector("video");
-
-        if (!video || video === attachedVideo)
-            return;
-
-        attachedVideo = video;
-
-        VIDEO_EVENTS.forEach(event =>
-            video.addEventListener(event, sendPresence)
-        );
-
-        sendPresence();
-    }
-
-    function onNavigation() {
-
-        attachedVideo = null;
-
-        updatePageState();
-
-        if (!location.pathname.startsWith("/watch/")) {
-            if (!document.hidden)
-                claim();
-
-            return;
-        }
-
-        const wait = setInterval(() => {
-            const title = getTitle();
-            const cover = getCover();
-
-            if (!title || !cover)
-                return;
-
-            clearInterval(wait);
-
-            attachVideoListeners();
-            sendPresence();
-
-            if (!document.hidden)
-                claim();
-        }, 50);
-    }
-
-    function connect(client, reconnect, onOpen) {
         socket = new WebSocket(BRIDGE_URL);
 
         socket.addEventListener("open", () => {
@@ -217,232 +88,542 @@
             onOpen();
         });
 
-        setupReconnect(socket, reconnect);
-    }
-
-    function send(type, data = {}) {
-        if (socket?.readyState !== WebSocket.OPEN)
-            return false;
-
-        socket.send(JSON.stringify({
-            type,
-            id: TAB_ID,
-            ...data
-        }));
-
-        return true;
-    }
-
-    function debugEmbed(...args) {
-        console.debug("[MiruroRPC]", ...args);
-    }
-
-    function claim() {
-        if (send("claim"))
-            sendPresence();
-    }
-
-    if (IS_MIRURO) {
-        document.addEventListener("visibilitychange", () => {
-            if (!document.hidden)
-                claim();
-        });
-    }
-
-    function setupReconnect(socket, reconnect) {
         socket.addEventListener("close", () => {
-            setTimeout(reconnect, 2000);
+            reconnectTimer = setTimeout(() => connect(client, onOpen), 2000);
         });
 
         socket.addEventListener("error", () => {
-            socket.close();
+            try {
+                socket.close();
+            } catch { /* ignore */ }
         });
     }
 
-    function connectMiruro() {
+    // ── Miruro DOM helpers ─────────────────────────────────────────────
 
-        connect("Miruro", connectMiruro, () => {
+    function isWatchPage() {
+        return location.pathname.startsWith("/watch");
+    }
 
-            updatePageState();
-            attachVideoListeners();
+    function cleanText(value) {
+        return String(value || "").replace(/\s+/g, " ").trim();
+    }
 
-            if (!document.hidden)
-                claim();
+    function isJunkTitle(text) {
+        if (!text || text.length < 2)
+            return true;
+        return (
+            /^miruro\b/i.test(text) ||
+            /watch anime online/i.test(text) ||
+            /^watching\b/i.test(text)
+        );
+    }
 
-            if (initialized)
+    function isEpisodeHeading(text) {
+        return /^\d+\.\s+\S+/.test(text);
+    }
+
+    function getTitle() {
+        const candidates = [];
+
+        // Series title beside the poster (link to /info/...)
+        for (const link of document.querySelectorAll('a[href*="/info/"]')) {
+            const text = cleanText(link.textContent);
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
+                candidates.push({
+                    text,
+                    score: link.querySelector("img") || link.closest('[class*="cover"], [class*="Cover"]')
+                        ? 20
+                        : 40
+                });
+        }
+
+        // Prefer title next to cover image
+        const cover = document.querySelector(
+            'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
+        );
+        if (cover) {
+            const card = cover.closest("div, article, section, aside") || cover.parentElement;
+            const heading = card?.querySelector("a[href*='/info/'], h1, h2, h3, .anime-title");
+            const text = cleanText(heading?.textContent);
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
+                candidates.push({ text, score: 100 });
+        }
+
+        for (const sel of [
+            "h1.anime-title",
+            ".anime-title",
+            '[class*="_romajiTitle_"]',
+            '[class*="infoDesktopTitle"]',
+            '[class*="infoMobileTitle"]'
+        ]) {
+            const text = cleanText(document.querySelector(sel)?.textContent);
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
+                candidates.push({ text, score: 50 });
+        }
+
+        // document.title sometimes: "Anime Name Episode 3 | Miruro"
+        const tab = cleanText(document.title)
+            .replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
+            .replace(/\s+Episode\s+\d+.*$/i, "")
+            .trim();
+        if (tab && !isJunkTitle(tab) && !isEpisodeHeading(tab))
+            candidates.push({ text: tab, score: 5 });
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0]?.text || null;
+    }
+
+    function getCover() {
+        const preferred = document.querySelector(
+            'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
+        );
+        if (preferred?.currentSrc || preferred?.src)
+            return preferred.currentSrc || preferred.src;
+
+        const images = [...document.querySelectorAll("img")];
+        const match = images.find((img) => {
+            const src = img.currentSrc || img.src || "";
+            return (
+                /anilist\.co/i.test(src) ||
+                /media\/anime\/cover/i.test(src) ||
+                /\/cover[s]?\//i.test(src)
+            );
+        });
+
+        return match ? (match.currentSrc || match.src) : null;
+    }
+
+    function getEpisode() {
+        const ep = Number(new URL(location.href).searchParams.get("ep"));
+        if (Number.isFinite(ep) && ep > 0)
+            return ep;
+
+        const heading = getEpisodeHeadingText();
+        const m = heading?.match(/^(\d+)\./);
+        return m ? Number(m[1]) : 1;
+    }
+
+    function getEpisodeHeadingText() {
+        const nodes = document.querySelectorAll("h1, h2, h3, h4, [class*='title']");
+        for (const node of nodes) {
+            const text = cleanText(node.textContent);
+            if (isEpisodeHeading(text) && text.length < 160)
+                return text;
+        }
+        return null;
+    }
+
+    function getEpisodeTitle(episode) {
+        const heading = getEpisodeHeadingText();
+        if (heading) {
+            const m = heading.match(/^(\d+)\.\s*(.+)$/);
+            if (m && Number(m[1]) === episode)
+                return cleanText(m[2]);
+        }
+
+        const list = document.querySelector("[data-episode-list]");
+        if (list) {
+            const nodes = [...list.querySelectorAll("button, a, li, [role='button'], div")];
+            for (const node of nodes) {
+                const text = cleanText(node.textContent);
+                if (!text)
+                    continue;
+
+                const numMatch = text.match(/(?:ep(?:isode)?\.?\s*)(\d+)/i) || text.match(/^(\d+)\b/);
+                if (!numMatch || Number(numMatch[1]) !== episode)
+                    continue;
+
+                const titled =
+                    text.match(/["“](.+?)["”]/) ||
+                    text.match(/^\d+\.\s*(.+)$/) ||
+                    text.match(/:\s*(.+)$/) ||
+                    text.match(/^\d+\s+(.+)$/);
+
+                if (titled?.[1])
+                    return cleanText(titled[1]);
+            }
+        }
+
+        return null;
+    }
+
+    function watchUrl() {
+        const url = new URL(location.href);
+        url.hash = "";
+        return url.toString();
+    }
+
+    function parseClock(value) {
+        const parts = String(value).split(":").map(Number);
+        if (!parts.length || parts.some((n) => !Number.isFinite(n)))
+            return null;
+        return parts.reduce((total, part) => total * 60 + part, 0);
+    }
+
+    /** Fallback when strmcx/video APIs are unavailable — read "3:24 / 23:40" from player UI. */
+    function readPlayerClock() {
+        const scopes = [
+            document.querySelector("strmcx-embed"),
+            document.querySelector(".plyr"),
+            document.querySelector('[class*="player"]'),
+            document.querySelector('[class*="Player"]')
+        ].filter(Boolean);
+
+        const texts = [];
+        for (const scope of scopes.length ? scopes : [document]) {
+            for (const el of scope.querySelectorAll("span, div, time")) {
+                const t = cleanText(el.textContent);
+                if (t && t.length <= 20 && /\d+:\d+/.test(t))
+                    texts.push(t);
+            }
+            texts.push(cleanText(scope.textContent).slice(0, 400));
+        }
+
+        for (const text of texts) {
+            const m = text.match(/(\d+:\d{2}(?::\d{2})?)\s*\/\s*(\d+:\d{2}(?::\d{2})?)/);
+            if (!m)
+                continue;
+            const currentTime = parseClock(m[1]);
+            const duration = parseClock(m[2]);
+            if (currentTime == null || duration == null || duration <= 0)
+                continue;
+
+            const paused = Boolean(
+                document.querySelector(
+                    '.plyr--paused, [aria-label="Play"], button[aria-label="Play"]'
+                )
+            ) && !document.querySelector('.plyr--playing, button[aria-label="Pause"]');
+
+            return { currentTime, duration, paused };
+        }
+
+        return null;
+    }
+
+    // ── playback (native video, strmcx, ok.ru, player clock) ───────────
+
+    function findVideoDeep(root = document, depth = 0) {
+        if (!root || depth > 6)
+            return null;
+
+        if (root.querySelector) {
+            const direct = root.querySelector("video");
+            if (direct)
+                return direct;
+        }
+
+        const all = root.querySelectorAll ? root.querySelectorAll("*") : [];
+        for (const el of all) {
+            if (el.shadowRoot) {
+                const found = findVideoDeep(el.shadowRoot, depth + 1);
+                if (found)
+                    return found;
+            }
+        }
+
+        return null;
+    }
+
+    function readMedia(media) {
+        if (!media)
+            return null;
+
+        try {
+            const currentTime = Number(media.currentTime);
+            const duration = Number(media.duration);
+            return {
+                currentTime: Number.isFinite(currentTime) ? currentTime : null,
+                duration: Number.isFinite(duration) && duration > 0 ? duration : null,
+                paused: Boolean(media.paused)
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    function createPlaybackTracker(onPlayback) {
+        let strmcxEl = null;
+        let okPlayer = null;
+        let last = {
+            currentTime: 0,
+            duration: null,
+            paused: true,
+            updatedAt: 0
+        };
+
+        const strmcxHandlers = {
+            "strmcx-time-update": (event) => {
+                const detail = event.detail || {};
+                const currentTime = Number(detail.currentTime);
+                const duration = Number(detail.duration);
+
+                if (Number.isFinite(currentTime))
+                    last.currentTime = currentTime;
+
+                if (Number.isFinite(duration) && duration > 0)
+                    last.duration = duration;
+
+                if (typeof detail.paused === "boolean")
+                    last.paused = detail.paused;
+                else if (typeof detail.playing === "boolean")
+                    last.paused = !detail.playing;
+                else
+                    last.paused = false;
+
+                last.updatedAt = Date.now();
+                flush();
+            },
+            "strmcx-duration-change": (event) => {
+                const duration = Number(event.detail?.duration);
+                if (Number.isFinite(duration) && duration > 0) {
+                    last.duration = duration;
+                    last.updatedAt = Date.now();
+                    flush();
+                }
+            },
+            "strmcx-ready": () => {
+                last.paused = false;
+                last.updatedAt = Date.now();
+                flush();
+            },
+            "strmcx-ended": () => {
+                last.paused = true;
+                last.updatedAt = Date.now();
+                flush();
+            }
+        };
+
+        function flush() {
+            if (!Number.isFinite(last.duration) || last.duration <= 0)
                 return;
 
-            initialized = true;
+            // If time updates stop while we previously looked "playing", treat as paused.
+            if (!last.paused && Date.now() - last.updatedAt > 1600)
+                last.paused = true;
+
+            onPlayback({
+                currentTime: Math.max(0, last.currentTime || 0),
+                duration: last.duration,
+                paused: last.paused
+            });
+        }
+
+        function detachStrmcx() {
+            if (!strmcxEl)
+                return;
+
+            for (const [name, handler] of Object.entries(strmcxHandlers))
+                strmcxEl.removeEventListener(name, handler, true);
+
+            strmcxEl = null;
+        }
+
+        function attachStrmcx(el) {
+            if (el === strmcxEl)
+                return;
+
+            detachStrmcx();
+            strmcxEl = el;
+
+            for (const [name, handler] of Object.entries(strmcxHandlers))
+                el.addEventListener(name, handler, true);
+        }
+
+        function getOkPlayer() {
+            if (!location.hostname.endsWith("ok.ru") || !window.OneVideoPlayer?.getPlayers)
+                return null;
+
+            try {
+                return window.OneVideoPlayer.getPlayers()[0] ?? null;
+            } catch {
+                return null;
+            }
+        }
+
+        function applyPlayback(playback) {
+            if (!playback?.duration)
+                return false;
+
+            last = {
+                currentTime: playback.currentTime ?? 0,
+                duration: playback.duration,
+                paused: Boolean(playback.paused),
+                updatedAt: Date.now()
+            };
+            flush();
+            return true;
+        }
+
+        function poll() {
+            const strmcx = document.querySelector("strmcx-embed");
+            if (strmcx)
+                attachStrmcx(strmcx);
+
+            const video = findVideoDeep(document);
+            if (video && applyPlayback(readMedia(video)))
+                return;
+
+            const ok = getOkPlayer();
+            if (ok)
+                okPlayer = ok;
+
+            if (okPlayer && applyPlayback(readMedia(okPlayer)))
+                return;
+
+            const clock = readPlayerClock();
+            if (clock && applyPlayback(clock))
+                return;
+
+            if (last.duration)
+                flush();
+        }
+
+        for (const [name, handler] of Object.entries(strmcxHandlers))
+            document.addEventListener(name, handler, true);
+
+        const timer = setInterval(poll, PLAYBACK_MS);
+        const observer = new MutationObserver(poll);
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        poll();
+
+        return () => {
+            clearInterval(timer);
+            observer.disconnect();
+            detachStrmcx();
+            for (const [name, handler] of Object.entries(strmcxHandlers))
+                document.removeEventListener(name, handler, true);
+        };
+    }
+
+    // ── Miruro client ──────────────────────────────────────────────────
+
+    function isFocusedMiruroTab() {
+        return IS_MIRURO && document.visibilityState === "visible";
+    }
+
+    function sendPresence(playback = null) {
+        if (!isFocusedMiruroTab() || !isWatchPage())
+            return;
+
+        const title = getTitle();
+        if (!title)
+            return;
+
+        const episode = getEpisode();
+        const cover = getCover();
+        const payload = {
+            title,
+            episode,
+            episodeTitle: getEpisodeTitle(episode),
+            cover,
+            url: watchUrl()
+        };
+
+        if (playback && Number.isFinite(playback.duration) && playback.duration > 0) {
+            payload.currentTime = playback.currentTime;
+            payload.duration = playback.duration;
+            payload.paused = playback.paused;
+        } else {
+            const local = readMedia(findVideoDeep(document));
+            if (local?.duration) {
+                payload.currentTime = local.currentTime;
+                payload.duration = local.duration;
+                payload.paused = local.paused;
+            }
+        }
+
+        send("presence", payload);
+    }
+
+    function claim() {
+        if (!isFocusedMiruroTab())
+            return;
+        if (!send("claim"))
+            return;
+        if (isWatchPage())
+            sendPresence();
+        else
+            send("browse");
+    }
+
+    function onNavigation() {
+        if (!isFocusedMiruroTab())
+            return;
+        claim();
+    }
+
+    function onFocusChange() {
+        if (isFocusedMiruroTab())
+            claim();
+        else if (IS_MIRURO)
+            send("hidden");
+    }
+
+    function hookHistory(fn) {
+        const original = history[fn];
+        history[fn] = function (...args) {
+            const result = original.apply(this, args);
+            onNavigation();
+            return result;
+        };
+    }
+
+    function startMiruroClient() {
+        connect("Miruro", () => {
+            if (isFocusedMiruroTab())
+                claim();
+
+            if (miruroReady)
+                return;
+
+            miruroReady = true;
+
+            createPlaybackTracker((playback) => {
+                if (!isFocusedMiruroTab() || !isWatchPage())
+                    return;
+
+                send("playback", playback);
+                sendPresence(playback);
+            });
 
             setInterval(() => {
-                if (location.pathname.startsWith("/watch/"))
+                if (isFocusedMiruroTab() && isWatchPage())
                     sendPresence();
-            }, PRESENCE_INTERVAL);
+            }, PRESENCE_MS);
 
-            const originalPushState = history.pushState;
-            history.pushState = function (...args) {
-                originalPushState.apply(this, args);
-                onNavigation();
-            };
-
-            const originalReplaceState = history.replaceState;
-            history.replaceState = function (...args) {
-                originalReplaceState.apply(this, args);
-                onNavigation();
-            };
-
+            hookHistory("pushState");
+            hookHistory("replaceState");
             window.addEventListener("popstate", onNavigation);
 
-        });
+            document.addEventListener("visibilitychange", onFocusChange);
+            window.addEventListener("focus", onFocusChange);
 
-    }
-
-    function connectPlayback() {
-
-        connect("Embed", connectPlayback, () => {
-
-            let currentMedia = null;
-            let currentType = null;
-
-            function getNativeVideo() {
-                return document.querySelector("video");
-            }
-
-            function getOKPlayer() {
-
-                if (
-                    !location.hostname.endsWith("ok.ru") ||
-                    !window.OneVideoPlayer?.getPlayers
-                ) {
-                    return null;
-                }
-
-                try {
-                    return window.OneVideoPlayer.getPlayers()[0] ?? null;
-                } catch {
-                    return null;
-                }
-            }
-
-            function getPlayback() {
-
-                if (!currentMedia)
-                    return null;
-
-                try {
-
-                    return {
-                        currentTime: Number(currentMedia.currentTime),
-                        duration: Number(currentMedia.duration),
-                        paused: Boolean(currentMedia.paused)
-                    };
-
-                } catch {
-                    return null;
-                }
-            }
-
-            function sendPlayback() {
-
-                const playback = getPlayback();
-
-                if (!playback)
-                    return;
-
-                send("playback", {
-                    currentTime: Number.isFinite(playback.currentTime)
-                        ? playback.currentTime
-                        : 0,
-                    duration: Number.isFinite(playback.duration)
-                        ? playback.duration
-                        : null,
-                    paused: playback.paused
-                });
-            }
-
-            function attachNativeVideo(video) {
-
-                currentMedia = video;
-                currentType = "native";
-
-                VIDEO_EVENTS.forEach(event =>
-                    video.addEventListener(
-                        event,
-                        sendPlayback
-                    )
-                );
-
-                sendPlayback();
-            }
-
-            function attachOKPlayer(player) {
-
-                currentMedia = player;
-                currentType = "ok";
-
-                sendPlayback();
-            }
-
-            function findPlayer() {
-
-                const video = getNativeVideo();
-
-                if (video) {
-
-                    if (
-                        currentMedia !== video ||
-                        currentType !== "native"
-                    ) {
-                        attachNativeVideo(video);
-                    }
-
-                    return;
-                }
-
-                const okPlayer = getOKPlayer();
-
-                if (okPlayer) {
-
-                    if (
-                        currentMedia !== okPlayer ||
-                        currentType !== "ok"
-                    ) {
-                        attachOKPlayer(okPlayer);
-                    }
-
-                    return;
-                }
-
-                currentMedia = null;
-                currentType = null;
-            }
-
-            findPlayer();
-
-            const playbackTimer = setInterval(() => {
-                findPlayer();
-                sendPlayback();
-            }, 1000);
-
-            const observer = new MutationObserver(findPlayer);
-
-            observer.observe(document.documentElement, {
-                childList: true,
-                subtree: true
+            // Leaving Miruro (close tab / navigate away) clears Discord presence.
+            window.addEventListener("pagehide", () => {
+                send("leave");
             });
-
-            socket.addEventListener("close", () => {
-                clearInterval(playbackTimer);
-                observer.disconnect();
-            });
-
         });
-
     }
 
-    initTabId();
+    // ── Embed client (cross-origin iframes) ────────────────────────────
 
-    if (IS_MIRURO) {
-        connectMiruro();
+    function startEmbedClient() {
+        if (embedReady || IS_MIRURO)
+            return;
+
+        embedReady = true;
+
+        connect("Embed", () => {
+            createPlaybackTracker((playback) => {
+                send("playback", playback);
+            });
+        });
     }
+
+    // ── boot ───────────────────────────────────────────────────────────
+
+    // Embed iframes only connect after a Miruro parent hands them a tab id.
+    if (IS_MIRURO)
+        startMiruroClient();
 })();
