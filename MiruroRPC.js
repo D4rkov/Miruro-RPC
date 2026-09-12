@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
-const VERSION = "2.1.1";
+const VERSION = "2.1.2";
 
 const DEBUG = process.argv.includes("--debug");
 
