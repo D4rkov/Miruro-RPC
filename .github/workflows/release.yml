@@ -24,7 +24,23 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Build & publish
+      # Build only — do NOT let electron-builder publish (it creates duplicate drafts).
+      - name: Build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --publish always
+        run: npx electron-builder --win --publish never
+
+      - name: Publish single GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/MiruroRPC-Setup-*.exe
+            dist/MiruroRPC-Setup-*.exe.blockmap
+            dist/latest.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
