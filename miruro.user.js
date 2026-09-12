@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.1.1
+// @version      2.1.2
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
@@ -502,12 +502,28 @@
         return IS_MIRURO && document.visibilityState === "visible";
     }
 
+    let activeWatchKey = null;
+    let presenceWaitTimer = null;
+
+    function getWatchKey() {
+        const match = location.pathname.match(/^\/watch\/([^/]+)/);
+        const animeId = match?.[1] || location.pathname;
+        return `${animeId}|${getEpisode()}`;
+    }
+
+    function cancelPresenceWait() {
+        if (presenceWaitTimer) {
+            clearTimeout(presenceWaitTimer);
+            presenceWaitTimer = null;
+        }
+    }
+
     function sendPresence(playback = null) {
         if (!isFocusedMiruroTab() || !isWatchPage())
             return;
 
         const title = getTitle();
-        if (!title)
+        if (!title || isJunkTitle(title))
             return;
 
         const episode = getEpisode();
@@ -533,7 +549,43 @@
             }
         }
 
+        activeWatchKey = getWatchKey();
         send("presence", payload);
+    }
+
+    /**
+     * After SPA navigation the old anime DOM often lingers briefly.
+     * Clear Discord immediately, then wait until title/cover change (or timeout).
+     */
+    function schedulePresenceWhenReady(previousTitle, previousCover) {
+        cancelPresenceWait();
+        const expectedKey = getWatchKey();
+        const startedAt = Date.now();
+
+        const attempt = () => {
+            presenceWaitTimer = null;
+
+            if (!isFocusedMiruroTab() || !isWatchPage())
+                return;
+            if (getWatchKey() !== expectedKey)
+                return;
+
+            const title = getTitle();
+            const cover = getCover();
+            const timedOut = Date.now() - startedAt >= 2500;
+            const titleReady = title && !isJunkTitle(title) && title !== previousTitle;
+            const coverReady = cover && cover !== previousCover;
+            const firstPaint = !previousTitle && title && !isJunkTitle(title);
+
+            if (firstPaint || titleReady || coverReady || (timedOut && title && !isJunkTitle(title))) {
+                sendPresence();
+                return;
+            }
+
+            presenceWaitTimer = setTimeout(attempt, 150);
+        };
+
+        presenceWaitTimer = setTimeout(attempt, 100);
     }
 
     function claim() {
@@ -541,10 +593,25 @@
             return;
         if (!send("claim"))
             return;
-        if (isWatchPage())
-            sendPresence();
-        else
+
+        if (!isWatchPage()) {
+            cancelPresenceWait();
+            activeWatchKey = null;
             send("browse");
+            return;
+        }
+
+        const key = getWatchKey();
+        if (key !== activeWatchKey) {
+            const previousTitle = getTitle();
+            const previousCover = getCover();
+            send("clear");
+            activeWatchKey = null;
+            schedulePresenceWhenReady(previousTitle, previousCover);
+            return;
+        }
+
+        sendPresence();
     }
 
     function onNavigation() {
@@ -582,14 +649,20 @@
             createPlaybackTracker((playback) => {
                 if (!isFocusedMiruroTab() || !isWatchPage())
                     return;
+                // Don't push playback while waiting for the new anime DOM.
+                if (activeWatchKey !== getWatchKey())
+                    return;
 
                 send("playback", playback);
                 sendPresence(playback);
             });
 
             setInterval(() => {
-                if (isFocusedMiruroTab() && isWatchPage())
-                    sendPresence();
+                if (!isFocusedMiruroTab() || !isWatchPage())
+                    return;
+                if (activeWatchKey !== getWatchKey() && presenceWaitTimer)
+                    return;
+                sendPresence();
             }, PRESENCE_MS);
 
             hookHistory("pushState");
@@ -599,8 +672,8 @@
             document.addEventListener("visibilitychange", onFocusChange);
             window.addEventListener("focus", onFocusChange);
 
-            // Leaving Miruro (close tab / navigate away) clears Discord presence.
             window.addEventListener("pagehide", () => {
+                cancelPresenceWait();
                 send("leave");
             });
         });

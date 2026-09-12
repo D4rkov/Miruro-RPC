@@ -218,6 +218,18 @@ function wireSocketServer(server) {
                             updateActivity();
                         }
                         break;
+                    case "clear":
+                        // SPA transition — drop stale anime immediately.
+                        if (data.id !== ownerId)
+                            break;
+                        cancelFocusClear();
+                        clearTab(data.id);
+                        pageMode = null;
+                        lastWatchSnapshot = null;
+                        lastActivityKey = null;
+                        clearActivity();
+                        emitStatus();
+                        break;
                     case "hidden":
                         // Focused tab lost focus — clear shortly unless another Miruro tab claims.
                         if (data.id === ownerId)
