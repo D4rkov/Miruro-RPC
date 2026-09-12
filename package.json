@@ -55,7 +55,8 @@
       {
         "provider": "github",
         "owner": "D4rkov",
-        "repo": "Miruro-RPC"
+        "repo": "Miruro-RPC",
+        "releaseType": "release"
       }
     ],
     "win": {
