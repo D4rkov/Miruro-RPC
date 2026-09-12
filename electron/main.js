@@ -6,6 +6,7 @@ const {
     Menu,
     nativeImage,
     shell,
+    dialog,
     Notification
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
@@ -14,6 +15,7 @@ const bridge = require("../MiruroRPC");
 
 const USERSCRIPT_INSTALL_URL =
     "https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
+const TAMPERMONKEY_URL = "https://www.tampermonkey.net/";
 const RELEASES_URL = "https://github.com/D4rkov/Miruro-RPC/releases";
 const MIRURO_URL = "https://www.miruro.tv";
 
@@ -154,7 +156,23 @@ function rebuildMenu() {
 }
 
 async function installUserscript() {
-    await shell.openExternal(USERSCRIPT_INSTALL_URL);
+    const { response } = await dialog.showMessageBox({
+        type: "question",
+        title: "Install userscript",
+        message: "Install the MiruroRPC userscript?",
+        detail:
+            "Needs Tampermonkey in your browser.\n" +
+            "If you already have it, choose Install script.",
+        buttons: ["Install script", "Get Tampermonkey", "Cancel"],
+        defaultId: 0,
+        cancelId: 2,
+        noLink: true
+    });
+
+    if (response === 0)
+        await shell.openExternal(USERSCRIPT_INSTALL_URL);
+    else if (response === 1)
+        await shell.openExternal(TAMPERMONKEY_URL);
 }
 
 function notify(title, body) {
