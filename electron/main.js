@@ -6,7 +6,6 @@ const {
     Menu,
     nativeImage,
     shell,
-    dialog,
     Notification
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
@@ -155,30 +154,7 @@ function rebuildMenu() {
 }
 
 async function installUserscript() {
-    // Prefer Tampermonkey install via raw GitHub URL when online;
-    // also open the local file as a fallback for offline/dev.
     await shell.openExternal(USERSCRIPT_INSTALL_URL);
-
-    const local = userscriptPath();
-    if (fs.existsSync(local)) {
-        const result = await dialog.showMessageBox({
-            type: "info",
-            title: "Install userscript",
-            message: "Install the MiruroRPC userscript",
-            detail:
-                "1. Install Tampermonkey in your browser\n" +
-                "2. Open the userscript install tab that just opened\n" +
-                "3. Click Install\n\n" +
-                "Tampermonkey will auto-update the script from GitHub.\n" +
-                "You can also paste from the local file if needed.",
-            buttons: ["Open local file", "OK"],
-            defaultId: 1,
-            cancelId: 1
-        });
-
-        if (result.response === 0)
-            await shell.openPath(local);
-    }
 }
 
 function notify(title, body) {
