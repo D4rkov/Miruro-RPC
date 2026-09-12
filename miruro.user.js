@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.1.3
+// @version      2.1.4
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
