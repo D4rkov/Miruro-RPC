@@ -65,10 +65,6 @@ npm run app     # test locally
 npm run ship    # commit + bump version + push + tag → CI builds the .exe
 ```
 
-That’s it. `npm run ship` handles version numbers for you (patch by default).
-
-Rarely, for a bigger bump: `npm run ship -- minor` or `npm run ship -- major`.
-
 ---
 
 ## FAQ
