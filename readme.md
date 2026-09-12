@@ -30,7 +30,6 @@ It starts with Windows by default and checks for updates automatically.
    (or open [`miruro.user.js`](https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js))
 3. Click **Install** in Tampermonkey
 
-The userscript auto-updates from GitHub. The tray app auto-updates from Releases.
 
 ### 3. Watch anime
 
