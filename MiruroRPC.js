@@ -5,7 +5,8 @@ const crypto = require("crypto");
 const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
-const VERSION = "2.1.6";
+const WS_HEARTBEAT_MS = 30000;
+const VERSION = "2.1.7";
 
 const DEBUG = process.argv.includes("--debug");
 
@@ -16,6 +17,7 @@ let pageMode = null; // "watch" | "browse" | null
 let focusClearTimer = null;
 let browseStart = null;
 let browseTimer = null;
+let heartbeatTimer = null;
 let dotFrame = 0;
 let lastActivityKey = null;
 let lastWatchSnapshot = null;
@@ -79,6 +81,7 @@ function start() {
 
 function stop() {
     stopBrowseTicker();
+    stopHeartbeat();
     clearActivity();
 
     if (reconnectTimer) {
@@ -104,16 +107,60 @@ function stop() {
         wss = null;
     }
 
-    if (rpc) {
-        try {
-            rpc.destroy();
-        } catch { /* ignore */ }
-        rpc = null;
-    }
-
+    destroyRPC();
     rpcReady = false;
     started = false;
     emitStatus();
+}
+
+function stopHeartbeat() {
+    if (!heartbeatTimer)
+        return;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+}
+
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+        for (const ws of [...clients]) {
+            if (ws.isAlive === false) {
+                debug("Terminating unresponsive WebSocket client.");
+                try {
+                    ws.terminate();
+                } catch { /* ignore */ }
+                continue;
+            }
+
+            ws.isAlive = false;
+            try {
+                ws.ping();
+            } catch {
+                try {
+                    ws.terminate();
+                } catch { /* ignore */ }
+            }
+        }
+    }, WS_HEARTBEAT_MS);
+}
+
+function destroyRPC() {
+    if (!rpc)
+        return;
+
+    try {
+        rpc.transport?.removeAllListeners();
+    } catch { /* ignore */ }
+
+    try {
+        rpc.removeAllListeners();
+    } catch { /* ignore */ }
+
+    try {
+        rpc.destroy();
+    } catch { /* ignore */ }
+
+    rpc = null;
 }
 
 function scheduleReconnect() {
@@ -130,6 +177,10 @@ function scheduleReconnect() {
 
 function disconnectRPC(message) {
     rpcReady = false;
+    // Discord may have wiped presence while we still hold the last key —
+    // invalidate so the next SET_ACTIVITY is not skipped as a duplicate.
+    lastActivityKey = null;
+    lastWatchSnapshot = null;
     emitStatus();
     if (message)
         debug(message);
@@ -137,19 +188,16 @@ function disconnectRPC(message) {
 }
 
 function connectRPC() {
-    if (rpc?.transport) {
-        try {
-            rpc.transport.removeAllListeners();
-        } catch { /* ignore */ }
-    }
-
-    if (rpc)
-        rpc.removeAllListeners();
+    destroyRPC();
+    rpcReady = false;
 
     rpc = new RPC.Client({ transport: "ipc" });
 
     rpc.on("ready", () => {
         rpcReady = true;
+        // Force re-push after IPC reconnect (sleep/wake often clears Discord's side).
+        lastActivityKey = null;
+        lastWatchSnapshot = null;
         info("Discord RPC connected.");
         emitStatus();
         updateActivity();
@@ -168,10 +216,36 @@ function connectRPC() {
     });
 }
 
+/** Call after OS sleep/wake so Discord IPC and presence dedupe recover. */
+function handleResume() {
+    debug("System resume — refreshing Discord RPC and probing WebSocket clients.");
+    lastActivityKey = null;
+    lastWatchSnapshot = null;
+
+    for (const ws of [...clients]) {
+        try {
+            ws.ping();
+        } catch {
+            try {
+                ws.terminate();
+            } catch { /* ignore */ }
+        }
+    }
+
+    disconnectRPC("System resumed.");
+}
+
 function wireSocketServer(server) {
+    startHeartbeat();
+
     server.on("connection", (ws) => {
+        ws.isAlive = true;
         clients.add(ws);
         emitStatus();
+
+        ws.on("pong", () => {
+            ws.isAlive = true;
+        });
 
         ws.on("message", (raw) => {
             try {
@@ -191,6 +265,8 @@ function wireSocketServer(server) {
                         // Focused Miruro tab takes ownership. Wait for browse/presence next.
                         cancelFocusClear();
                         ownerId = data.id;
+                        // Reclaim after sleep/reload must be allowed to re-SET_ACTIVITY.
+                        lastActivityKey = null;
                         emitStatus();
                         break;
                     case "browse":
@@ -590,8 +666,13 @@ function activityKey(activity) {
 }
 
 function setActivity(activity) {
-    if (!rpcReady || !rpc?.transport?.socket)
+    if (!rpcReady)
         return;
+
+    if (!rpc?.transport?.socket) {
+        disconnectRPC("Discord IPC socket missing.");
+        return;
+    }
 
     const key = activityKey(activity);
     if (key === lastActivityKey) {
@@ -614,6 +695,7 @@ function setActivity(activity) {
     } catch (err) {
         console.error("SET_ACTIVITY failed:", err.message);
         lastActivityKey = null;
+        disconnectRPC(`SET_ACTIVITY failed: ${err.message}`);
     }
 }
 
@@ -638,7 +720,8 @@ module.exports = {
     start,
     stop,
     getStatus,
-    onStatus
+    onStatus,
+    handleResume
 };
 
 if (require.main === module)

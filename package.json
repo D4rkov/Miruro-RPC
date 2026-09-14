@@ -1,6 +1,6 @@
 {
   "name": "mirurorpc",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "description": "Discord Rich Presence for Miruro — system tray bridge + userscript",
   "homepage": "https://github.com/D4rkov/Miruro-RPC#readme",
   "bugs": {

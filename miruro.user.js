@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.1.6
+// @version      2.1.7
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
@@ -21,12 +21,16 @@
     const IS_FRAME = window !== window.top;
     const PRESENCE_MS = 4000;
     const PLAYBACK_MS = 1000;
+    const OPEN_TIMEOUT_MS = 5000;
 
     let tabId = crypto.randomUUID();
     let socket = null;
     let reconnectTimer = null;
+    let openTimer = null;
     let miruroReady = false;
     let embedReady = false;
+    let connectClient = null;
+    let connectOnOpen = null;
 
     // ── messaging / tab identity (Miruro ↔ embed iframes) ───────────────
 
@@ -71,32 +75,92 @@
         return true;
     }
 
+    function clearOpenTimer() {
+        if (!openTimer)
+            return;
+        clearTimeout(openTimer);
+        openTimer = null;
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer)
+            return;
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            if (connectClient && connectOnOpen)
+                connect(connectClient, connectOnOpen);
+        }, 2000);
+    }
+
     function connect(client, onOpen) {
+        connectClient = client;
+        connectOnOpen = onOpen;
+
         if (reconnectTimer) {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+        clearOpenTimer();
 
-        try {
-            socket?.close();
-        } catch { /* ignore */ }
+        const prev = socket;
+        socket = null;
+        if (prev) {
+            try {
+                prev.close();
+            } catch { /* ignore */ }
+        }
 
-        socket = new WebSocket(BRIDGE_URL);
+        const s = new WebSocket(BRIDGE_URL);
+        socket = s;
 
-        socket.addEventListener("open", () => {
+        openTimer = setTimeout(() => {
+            openTimer = null;
+            if (socket !== s || s.readyState === WebSocket.OPEN)
+                return;
+            try {
+                s.close();
+            } catch { /* ignore */ }
+        }, OPEN_TIMEOUT_MS);
+
+        s.addEventListener("open", () => {
+            if (socket !== s)
+                return;
+            clearOpenTimer();
             send("hello", { client });
             onOpen();
         });
 
-        socket.addEventListener("close", () => {
-            reconnectTimer = setTimeout(() => connect(client, onOpen), 2000);
+        s.addEventListener("close", () => {
+            if (socket !== s)
+                return;
+            clearOpenTimer();
+            scheduleReconnect();
         });
 
-        socket.addEventListener("error", () => {
+        s.addEventListener("error", () => {
+            if (socket !== s)
+                return;
             try {
-                socket.close();
+                s.close();
             } catch { /* ignore */ }
         });
+    }
+
+    /** After sleep, browser WS can look open while the bridge already dropped it. */
+    function ensureConnected() {
+        if (!connectClient || !connectOnOpen)
+            return;
+
+        if (socket?.readyState === WebSocket.OPEN) {
+            if (IS_MIRURO && isFocusedMiruroTab())
+                claim();
+            return;
+        }
+
+        if (socket?.readyState === WebSocket.CONNECTING)
+            return;
+
+        connect(connectClient, connectOnOpen);
     }
 
     // ── Miruro DOM helpers ─────────────────────────────────────────────
@@ -504,6 +568,7 @@
 
     let activeWatchKey = null;
     let presenceWaitTimer = null;
+    let lastHiddenAt = 0;
 
     function getWatchKey() {
         const match = location.pathname.match(/^\/watch\/([^/]+)/);
@@ -621,10 +686,22 @@
     }
 
     function onFocusChange() {
-        if (isFocusedMiruroTab())
-            claim();
-        else if (IS_MIRURO)
+        if (isFocusedMiruroTab()) {
+            // Long hidden periods (sleep) often leave a half-open WS that never fires close.
+            if (lastHiddenAt && Date.now() - lastHiddenAt > 60000 && connectClient && connectOnOpen) {
+                lastHiddenAt = 0;
+                connect(connectClient, connectOnOpen);
+                return;
+            }
+            lastHiddenAt = 0;
+            ensureConnected();
+            return;
+        }
+
+        if (IS_MIRURO) {
+            lastHiddenAt = Date.now();
             send("hidden");
+        }
     }
 
     function hookHistory(fn) {
@@ -671,6 +748,7 @@
 
             document.addEventListener("visibilitychange", onFocusChange);
             window.addEventListener("focus", onFocusChange);
+            window.addEventListener("pageshow", () => ensureConnected());
 
             window.addEventListener("pagehide", () => {
                 cancelPresenceWait();
