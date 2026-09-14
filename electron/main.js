@@ -7,7 +7,8 @@ const {
     nativeImage,
     shell,
     dialog,
-    Notification
+    Notification,
+    powerMonitor
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
 
@@ -265,6 +266,12 @@ app.whenReady().then(() => {
 
     bridge.onStatus(() => rebuildMenu());
     bridge.start();
+
+    powerMonitor.on("resume", () => {
+        try {
+            bridge.handleResume();
+        } catch { /* ignore */ }
+    });
 
     createTray();
     setupAutoUpdater();
