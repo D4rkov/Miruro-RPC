@@ -3,9 +3,9 @@
  * One-command release:
  *   npm run ship
  *
- * - Syncs version across package.json / userscript / bridge
- * - Commits any pending work
- * - Bumps patch version (or: npm run ship -- minor|major)
+ * - Commits any pending work (do NOT bump versions by hand)
+ * - Bumps from the latest git tag (patch by default; or: npm run ship -- minor|major)
+ * - Syncs package.json / userscript / bridge to that version
  * - Pushes commit + tag → GitHub Actions builds & publishes the .exe
  */
 
@@ -45,11 +45,18 @@ function writeJson(file, data) {
   );
 }
 
+function parseSemver(version) {
+  const parts = String(version).replace(/^v/, "").split(".").map((n) => Number(n));
+  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n)))
+    return null;
+  return parts;
+}
+
 function bumpSemver(version, type) {
-  const parts = version.split(".").map((n) => Number(n));
-  if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) {
+  const parts = parseSemver(version);
+  if (!parts)
     throw new Error(`Bad version: ${version}`);
-  }
+
   let [major, minor, patch] = parts;
   if (type === "major") {
     major += 1;
@@ -62,6 +69,35 @@ function bumpSemver(version, type) {
     patch += 1;
   }
   return `${major}.${minor}.${patch}`;
+}
+
+function cmpSemver(a, b) {
+  const pa = parseSemver(a);
+  const pb = parseSemver(b);
+  if (!pa || !pb)
+    return 0;
+  for (let i = 0; i < 3; i++) {
+    if (pa[i] !== pb[i])
+      return pa[i] - pb[i];
+  }
+  return 0;
+}
+
+/** Latest vX.Y.Z tag on this repo (local), or null. */
+function latestVersionTag() {
+  let tags = "";
+  try {
+    tags = runOut("git tag -l \"v*\" --sort=-v:refname");
+  } catch {
+    return null;
+  }
+
+  for (const line of tags.split(/\r?\n/)) {
+    const tag = line.trim();
+    if (parseSemver(tag))
+      return tag.replace(/^v/, "");
+  }
+  return null;
 }
 
 function syncVersionFiles(version) {
@@ -86,7 +122,18 @@ function syncVersionFiles(version) {
   fs.writeFileSync(userPath, userscript);
 }
 
-// Must be on main (or allow any branch but warn)
+function syncLockfile(version) {
+  const lockPath = path.join(root, "package-lock.json");
+  if (!fs.existsSync(lockPath))
+    return;
+
+  const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+  lock.version = version;
+  if (lock.packages && lock.packages[""])
+    lock.packages[""].version = version;
+  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
+}
+
 try {
   runOut("git rev-parse --is-inside-work-tree");
 } catch {
@@ -99,7 +146,7 @@ if (branch !== "main" && branch !== "master") {
   console.warn(`Warning: you are on "${branch}", not main.`);
 }
 
-// Commit pending work so version bump can run cleanly
+// Commit pending work so the release commit only contains the version bump.
 const dirty = runOut("git status --porcelain");
 if (dirty) {
   console.log("\nCommitting current changes before release…");
@@ -111,26 +158,38 @@ if (dirty) {
   }
 }
 
-const current = readJson("package.json").version;
-const next = bumpSemver(current, bump);
+const pkgVersion = readJson("package.json").version;
+const tagged = latestVersionTag();
+const base = tagged || pkgVersion;
 
-console.log(`\nReleasing ${current} → ${next} (${bump})\n`);
+if (tagged && cmpSemver(pkgVersion, tagged) !== 0) {
+  console.warn(
+    `\nNote: package.json is ${pkgVersion} but latest tag is v${tagged}.` +
+      `\nShip always bumps from the latest tag — do not edit versions by hand.\n`
+  );
+}
+
+const next = bumpSemver(base, bump);
+
+if (tagged && cmpSemver(next, tagged) <= 0) {
+  console.error(`Refusing to release v${next}: latest tag is already v${tagged}.`);
+  process.exit(1);
+}
+
+// Tag must not already exist (e.g. failed mid-ship).
+try {
+  runOut(`git rev-parse -q --verify "refs/tags/v${next}"`);
+  console.error(`Tag v${next} already exists. Fix tags before shipping again.`);
+  process.exit(1);
+} catch {
+  // missing tag — good
+}
+
+console.log(`\nReleasing v${base} → v${next} (${bump}, from latest tag)\n`);
 syncVersionFiles(next);
+syncLockfile(next);
 
 run("git add package.json package-lock.json MiruroRPC.js miruro.user.js");
-// package-lock may also get version via npm — refresh lock version field
-try {
-  const lockPath = path.join(root, "package-lock.json");
-  if (fs.existsSync(lockPath)) {
-    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    lock.version = next;
-    if (lock.packages && lock.packages[""])
-      lock.packages[""].version = next;
-    fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + "\n");
-    run("git add package-lock.json");
-  }
-} catch { /* ignore */ }
-
 run(`git commit -m "release: v${next}"`);
 run(`git tag v${next}`);
 
