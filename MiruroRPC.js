@@ -6,7 +6,7 @@ const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
 const WS_HEARTBEAT_MS = 30000;
-const VERSION = "2.1.7";
+const VERSION = "2.1.8";
 
 const DEBUG = process.argv.includes("--debug");
 
@@ -265,8 +265,10 @@ function wireSocketServer(server) {
                         // Focused Miruro tab takes ownership. Wait for browse/presence next.
                         cancelFocusClear();
                         ownerId = data.id;
-                        // Reclaim after sleep/reload must be allowed to re-SET_ACTIVITY.
+                        // Reclaim after sleep/reload must be allowed to re-SET_ACTIVITY
+                        // (including timestamps — don't leave shouldPushWatchUpdate blocking).
                         lastActivityKey = null;
+                        lastWatchSnapshot = null;
                         emitStatus();
                         break;
                     case "browse":
@@ -437,9 +439,9 @@ function hasValidPlayback(data) {
 function mergePresenceWithPlayback(presence, playback) {
     const data = { ...presence };
 
-    if (hasValidPlayback(data))
-        return data;
-
+    // Playback channel is authoritative for the progress bar. Presence often
+    // arrives without times (claim / 4s metadata tick) or with a stale local
+    // scrape — never let that override a live playback update.
     if (hasValidPlayback(playback)) {
         data.currentTime = playback.currentTime;
         data.duration = playback.duration;
@@ -593,7 +595,12 @@ function handleWatch(data) {
     if (hasValidPlayback(data))
         applyTimestamps(activity, data);
 
-    if (hasValidPlayback(data) && !shouldPushWatchUpdate(data)) {
+    // Always push when Discord may have lost the activity (dedupe key cleared).
+    if (
+        lastActivityKey != null &&
+        hasValidPlayback(data) &&
+        !shouldPushWatchUpdate(data)
+    ) {
         debug("Skipped playback tick.");
         return;
     }

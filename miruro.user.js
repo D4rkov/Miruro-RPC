@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.1.7
+// @version      2.1.8
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
@@ -22,6 +22,7 @@
     const PRESENCE_MS = 4000;
     const PLAYBACK_MS = 1000;
     const OPEN_TIMEOUT_MS = 5000;
+    const RECONNECT_MS = 500;
 
     let tabId = crypto.randomUUID();
     let socket = null;
@@ -89,7 +90,7 @@
             reconnectTimer = null;
             if (connectClient && connectOnOpen)
                 connect(connectClient, connectOnOpen);
-        }, 2000);
+        }, RECONNECT_MS);
     }
 
     function connect(client, onOpen) {
@@ -187,6 +188,40 @@
         return /^\d+\.\s+\S+/.test(text);
     }
 
+    /** Player chrome often sits in the same wrapper as "6. Episode Title". */
+    const EPISODE_CHROME_RE =
+        /\b(AUDIO|SERVER|SUB|DUB|HD|FHD|AUTO|QUALITY|SOURCE|CC|SUBTITLES?)\b/i;
+
+    function ownText(node) {
+        if (!node)
+            return "";
+        let text = "";
+        for (const child of node.childNodes) {
+            if (child.nodeType === Node.TEXT_NODE)
+                text += child.textContent;
+        }
+        return cleanText(text);
+    }
+
+    function scrubEpisodeTitle(text) {
+        let value = cleanText(text);
+        if (!value)
+            return null;
+
+        // Stop at player chrome even when glued: "TitleAUDIOSERVER(9)"
+        value = value.replace(
+            /(?:AUDIO|SERVER|SUB|DUB|HD|FHD|AUTO|QUALITY|SOURCE|CC|SUBTITLES?).*$/i,
+            ""
+        );
+        value = value.replace(/[\s·|/\-–—]+$/g, "").replace(/\(\d+\)\s*$/g, "").trim();
+        value = value.replace(/\.+$/g, "").trim();
+
+        if (!value || value.length < 2 || EPISODE_CHROME_RE.test(value))
+            return null;
+
+        return value;
+    }
+
     function getTitle() {
         const candidates = [];
 
@@ -271,9 +306,18 @@
     function getEpisodeHeadingText() {
         const nodes = document.querySelectorAll("h1, h2, h3, h4, [class*='title']");
         for (const node of nodes) {
-            const text = cleanText(node.textContent);
-            if (isEpisodeHeading(text) && text.length < 160)
-                return text;
+            // Prefer direct text so AUDIO / SERVER sibling controls are ignored.
+            const direct = ownText(node);
+            const text = isEpisodeHeading(direct) ? direct : cleanText(node.textContent);
+            if (!isEpisodeHeading(text) || text.length >= 160)
+                continue;
+
+            const m = text.match(/^(\d+)\.\s*(.+)$/);
+            const title = scrubEpisodeTitle(m?.[2] || "");
+            if (!title)
+                continue;
+
+            return `${m[1]}. ${title}`;
         }
         return null;
     }
@@ -283,29 +327,31 @@
         if (heading) {
             const m = heading.match(/^(\d+)\.\s*(.+)$/);
             if (m && Number(m[1]) === episode)
-                return cleanText(m[2]);
+                return scrubEpisodeTitle(m[2]);
         }
 
         const list = document.querySelector("[data-episode-list]");
         if (list) {
             const nodes = [...list.querySelectorAll("button, a, li, [role='button'], div")];
             for (const node of nodes) {
-                const text = cleanText(node.textContent);
+                const text = scrubEpisodeTitle(ownText(node)) || scrubEpisodeTitle(node.textContent);
                 if (!text)
                     continue;
 
-                const numMatch = text.match(/(?:ep(?:isode)?\.?\s*)(\d+)/i) || text.match(/^(\d+)\b/);
+                const raw = cleanText(node.textContent);
+                const numMatch = raw.match(/(?:ep(?:isode)?\.?\s*)(\d+)/i) || raw.match(/^(\d+)\b/);
                 if (!numMatch || Number(numMatch[1]) !== episode)
                     continue;
 
                 const titled =
-                    text.match(/["“](.+?)["”]/) ||
-                    text.match(/^\d+\.\s*(.+)$/) ||
-                    text.match(/:\s*(.+)$/) ||
-                    text.match(/^\d+\s+(.+)$/);
+                    raw.match(/["“](.+?)["”]/) ||
+                    raw.match(/^\d+\.\s*(.+)$/) ||
+                    raw.match(/:\s*(.+)$/) ||
+                    raw.match(/^\d+\s+(.+)$/);
 
-                if (titled?.[1])
-                    return cleanText(titled[1]);
+                const cleaned = scrubEpisodeTitle(titled?.[1] || text);
+                if (cleaned)
+                    return cleaned;
             }
         }
 
@@ -339,12 +385,12 @@
             for (const el of scope.querySelectorAll("span, div, time")) {
                 const t = cleanText(el.textContent);
                 if (t && t.length <= 20 && /\d+:\d+/.test(t))
-                    texts.push(t);
+                    texts.push({ text: t, scope });
             }
-            texts.push(cleanText(scope.textContent).slice(0, 400));
+            texts.push({ text: cleanText(scope.textContent).slice(0, 400), scope });
         }
 
-        for (const text of texts) {
+        for (const { text, scope } of texts) {
             const m = text.match(/(\d+:\d{2}(?::\d{2})?)\s*\/\s*(\d+:\d{2}(?::\d{2})?)/);
             if (!m)
                 continue;
@@ -353,11 +399,12 @@
             if (currentTime == null || duration == null || duration <= 0)
                 continue;
 
+            // Only look for pause UI inside the player — page-wide "Play" buttons
+            // (episode list, etc.) falsely freeze the Discord progress bar.
+            const root = scope || document;
             const paused = Boolean(
-                document.querySelector(
-                    '.plyr--paused, [aria-label="Play"], button[aria-label="Play"]'
-                )
-            ) && !document.querySelector('.plyr--playing, button[aria-label="Pause"]');
+                root.querySelector('.plyr--paused, [aria-label="Play"], button[aria-label="Play"]')
+            ) && !root.querySelector('.plyr--playing, button[aria-label="Pause"]');
 
             return { currentTime, duration, paused };
         }
@@ -413,7 +460,9 @@
             currentTime: 0,
             duration: null,
             paused: true,
-            updatedAt: 0
+            updatedAt: 0,
+            // Wall-clock of the last time currentTime actually advanced while playing.
+            movingAt: 0
         };
 
         const strmcxHandlers = {
@@ -422,21 +471,19 @@
                 const currentTime = Number(detail.currentTime);
                 const duration = Number(detail.duration);
 
-                if (Number.isFinite(currentTime))
-                    last.currentTime = currentTime;
-
-                if (Number.isFinite(duration) && duration > 0)
-                    last.duration = duration;
-
+                let paused;
                 if (typeof detail.paused === "boolean")
-                    last.paused = detail.paused;
+                    paused = detail.paused;
                 else if (typeof detail.playing === "boolean")
-                    last.paused = !detail.playing;
+                    paused = !detail.playing;
                 else
-                    last.paused = false;
+                    paused = false;
 
-                last.updatedAt = Date.now();
-                flush();
+                applyPlayback({
+                    currentTime: Number.isFinite(currentTime) ? currentTime : last.currentTime,
+                    duration: Number.isFinite(duration) && duration > 0 ? duration : last.duration,
+                    paused
+                });
             },
             "strmcx-duration-change": (event) => {
                 const duration = Number(event.detail?.duration);
@@ -446,15 +493,35 @@
                     flush();
                 }
             },
+            "strmcx-pause": () => {
+                applyPlayback({
+                    currentTime: last.currentTime,
+                    duration: last.duration,
+                    paused: true
+                });
+            },
+            "strmcx-play": () => {
+                last.movingAt = Date.now();
+                applyPlayback({
+                    currentTime: last.currentTime,
+                    duration: last.duration,
+                    paused: false
+                });
+            },
             "strmcx-ready": () => {
-                last.paused = false;
-                last.updatedAt = Date.now();
-                flush();
+                last.movingAt = Date.now();
+                applyPlayback({
+                    currentTime: last.currentTime,
+                    duration: last.duration,
+                    paused: false
+                });
             },
             "strmcx-ended": () => {
-                last.paused = true;
-                last.updatedAt = Date.now();
-                flush();
+                applyPlayback({
+                    currentTime: last.currentTime,
+                    duration: last.duration,
+                    paused: true
+                });
             }
         };
 
@@ -462,8 +529,8 @@
             if (!Number.isFinite(last.duration) || last.duration <= 0)
                 return;
 
-            // If time updates stop while we previously looked "playing", treat as paused.
-            if (!last.paused && Date.now() - last.updatedAt > 1600)
+            // Time not advancing ⇒ paused (don't use updatedAt — stagnant clock refreshes it).
+            if (!last.paused && last.movingAt && Date.now() - last.movingAt > 1500)
                 last.paused = true;
 
             onPlayback({
@@ -505,16 +572,42 @@
             }
         }
 
+        function isPausedMedia(playback) {
+            return Boolean(
+                playback?.duration &&
+                playback.paused &&
+                (playback.currentTime || 0) >= 0.5
+            );
+        }
+
         function applyPlayback(playback) {
             if (!playback?.duration)
                 return false;
 
+            const nextTime = Math.max(0, playback.currentTime ?? 0);
+            let paused = Boolean(playback.paused);
+
+            if (!paused) {
+                if (Math.abs(nextTime - (last.currentTime || 0)) >= 0.5)
+                    last.movingAt = Date.now();
+                else if (last.movingAt && Date.now() - last.movingAt > 1500)
+                    paused = true;
+            }
+
+            // While already paused, keep the frozen position (±1s clock jitter).
+            const currentTime =
+                paused && last.paused && Math.abs(nextTime - last.currentTime) < 1.5
+                    ? last.currentTime
+                    : nextTime;
+
             last = {
-                currentTime: playback.currentTime ?? 0,
+                currentTime,
                 duration: playback.duration,
-                paused: Boolean(playback.paused),
-                updatedAt: Date.now()
+                paused,
+                updatedAt: Date.now(),
+                movingAt: paused ? last.movingAt : (last.movingAt || Date.now())
             };
+
             flush();
             return true;
         }
@@ -524,20 +617,46 @@
             if (strmcx)
                 attachStrmcx(strmcx);
 
-            const video = findVideoDeep(document);
-            if (video && applyPlayback(readMedia(video)))
-                return;
+            const videoPlayback = readMedia(findVideoDeep(document));
 
             const ok = getOkPlayer();
             if (ok)
                 okPlayer = ok;
+            const okPlayback = readMedia(okPlayer);
 
-            if (okPlayer && applyPlayback(readMedia(okPlayer)))
+            // Real media pause wins immediately — never let the clock un-pause us.
+            if (isPausedMedia(videoPlayback)) {
+                applyPlayback(videoPlayback);
+                return;
+            }
+            if (isPausedMedia(okPlayback)) {
+                applyPlayback(okPlayback);
+                return;
+            }
+
+            if (videoPlayback && !videoPlayback.paused && applyPlayback(videoPlayback))
+                return;
+
+            if (okPlayback && !okPlayback.paused && applyPlayback(okPlayback))
                 return;
 
             const clock = readPlayerClock();
-            if (clock && applyPlayback(clock))
+            if (clock) {
+                const delta = Math.abs((clock.currentTime || 0) - (last.currentTime || 0));
+                // Stagnant clock, or we were already paused and time didn't jump ⇒ stay paused.
+                const stalled =
+                    Boolean(last.duration) &&
+                    delta < 0.75 &&
+                    last.movingAt &&
+                    Date.now() - last.movingAt > 1500;
+                const holdPause = last.paused && delta < 1.25;
+                applyPlayback({
+                    currentTime: holdPause || stalled ? last.currentTime : clock.currentTime,
+                    duration: clock.duration,
+                    paused: Boolean(clock.paused || stalled || holdPause)
+                });
                 return;
+            }
 
             if (last.duration)
                 flush();
@@ -670,8 +789,16 @@
         if (key !== activeWatchKey) {
             const previousTitle = getTitle();
             const previousCover = getCover();
+            const hadPrevious = Boolean(activeWatchKey);
             send("clear");
             activeWatchKey = null;
+
+            // Userscript update / first claim: DOM is already painted — don't wait 2.5s.
+            if (!hadPrevious && previousTitle && !isJunkTitle(previousTitle)) {
+                sendPresence();
+                return;
+            }
+
             schedulePresenceWhenReady(previousTitle, previousCover);
             return;
         }
