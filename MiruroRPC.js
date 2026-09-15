@@ -6,7 +6,7 @@ const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
 const WS_HEARTBEAT_MS = 30000;
-const VERSION = "2.1.8";
+const VERSION = "2.1.9";
 
 const DEBUG = process.argv.includes("--debug");
 
