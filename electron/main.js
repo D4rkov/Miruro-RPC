@@ -18,7 +18,7 @@ const USERSCRIPT_INSTALL_URL =
     "https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
 const TAMPERMONKEY_URL = "https://www.tampermonkey.net/";
 const RELEASES_URL = "https://github.com/D4rkov/Miruro-RPC/releases";
-const MIRURO_URL = "https://www.miruro.tv";
+const MIRURO_URL = "https://barelystarted.miruro.tv";
 
 let tray = null;
 let quitting = false;
@@ -92,7 +92,7 @@ function rebuildMenu() {
 
     const template = [
         {
-            label: `MiruroRPC v${app.getVersion()}`,
+            label: `MiruroRPC v${status.version || app.getVersion()}`,
             enabled: false
         },
         {

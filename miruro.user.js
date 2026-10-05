@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.1.9
+// @version      2.2.0
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
+// @sandbox      DOM
+// @inject-into  auto
 // @updateURL    https://raw.githubusercontent.com/D4rkov/Miruro-RPC/main/miruro.user.js
 // @downloadURL  https://raw.githubusercontent.com/D4rkov/Miruro-RPC/main/miruro.user.js
 // @supportURL   https://github.com/D4rkov/Miruro-RPC/issues
@@ -30,12 +32,32 @@
     let openTimer = null;
     let miruroReady = false;
     let embedReady = false;
+    let embedIdReady = false;
     let connectClient = null;
     let connectOnOpen = null;
 
     // ── messaging / tab identity (Miruro ↔ embed iframes) ───────────────
 
     const pendingChildren = new Set();
+
+    function announceTabIdToFrames() {
+        if (!IS_MIRURO)
+            return;
+
+        for (const frame of document.querySelectorAll("iframe")) {
+            try {
+                frame.contentWindow?.postMessage({ type: "miruro-rpc-id", id: tabId }, "*");
+            } catch { /* cross-origin access can throw on some browsers */ }
+        }
+    }
+
+    function requestTabId() {
+        if (IS_MIRURO || embedReady || embedIdReady)
+            return;
+        try {
+            window.parent.postMessage("miruro-rpc-id-request", "*");
+        } catch { /* ignore */ }
+    }
 
     window.addEventListener("message", (event) => {
         if (event.data === "miruro-rpc-id-request") {
@@ -44,8 +66,28 @@
                 return;
             }
 
+            // Intermediate iframe — ask parent, then relay down.
             pendingChildren.add(event.source);
-            window.parent.postMessage("miruro-rpc-id-request", "*");
+            requestTabId();
+            return;
+        }
+
+        // Embed iframes relay playback here so they don't need ws://127.0.0.1
+        // (third-party hosts often block private-network WebSockets).
+        if (IS_MIRURO && event.data?.type === "miruro-rpc-playback") {
+            if (!isFocusedMiruroTab() || !isWatchPage())
+                return;
+
+            const currentTime = Number(event.data.currentTime);
+            const duration = Number(event.data.duration);
+            if (!Number.isFinite(duration) || duration <= 0)
+                return;
+
+            send("playback", {
+                currentTime: Number.isFinite(currentTime) ? currentTime : 0,
+                duration,
+                paused: Boolean(event.data.paused)
+            });
             return;
         }
 
@@ -53,18 +95,30 @@
             return;
 
         tabId = event.data.id;
+        embedIdReady = true;
 
         for (const child of pendingChildren) {
             child?.postMessage({ type: "miruro-rpc-id", id: tabId }, "*");
         }
         pendingChildren.clear();
 
-        if (!IS_MIRURO && !embedReady)
+        if (!IS_MIRURO && IS_FRAME && !embedReady)
             startEmbedClient();
     });
 
-    if (!IS_MIRURO)
-        window.parent.postMessage("miruro-rpc-id-request", "*");
+    // Embed frames: keep asking until Miruro answers (first ping is easy to miss
+    // at document-start while the parent script is still booting).
+    if (!IS_MIRURO && IS_FRAME) {
+        requestTabId();
+        const idRetry = setInterval(() => {
+            if (embedReady || embedIdReady) {
+                clearInterval(idRetry);
+                return;
+            }
+            requestTabId();
+        }, 500);
+        setTimeout(() => clearInterval(idRetry), 30000);
+    }
 
     // ── bridge ─────────────────────────────────────────────────────────
 
@@ -180,12 +234,27 @@
         return (
             /^miruro\b/i.test(text) ||
             /watch anime online/i.test(text) ||
-            /^watching\b/i.test(text)
+            /^free anime streaming/i.test(text) ||
+            /^watching\b/i.test(text) ||
+            /^episode\s+\d+\b/i.test(text) ||
+            /^ep\s*\d+\b/i.test(text) ||
+            /^(details|home|trending|schedule|history|profile|search|discover)$/i.test(text)
         );
     }
 
     function isEpisodeHeading(text) {
-        return /^\d+\.\s+\S+/.test(text);
+        // v1: "6. Episode Title" — v2: "Episode 1" / "Ep 1"
+        return (
+            /^\d+\.\s+\S+/.test(text) ||
+            /^Episode\s+\d+\b/i.test(text) ||
+            /^Ep\s*\d+\b/i.test(text)
+        );
+    }
+
+    function metaContents(property) {
+        return [...document.querySelectorAll(`meta[property="${property}"]`)]
+            .map((node) => cleanText(node.getAttribute("content")))
+            .filter(Boolean);
     }
 
     /** Player chrome often sits in the same wrapper as "6. Episode Title". */
@@ -225,30 +294,7 @@
     function getTitle() {
         const candidates = [];
 
-        // Series title beside the poster (link to /info/...)
-        for (const link of document.querySelectorAll('a[href*="/info/"]')) {
-            const text = cleanText(link.textContent);
-            if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
-                candidates.push({
-                    text,
-                    score: link.querySelector("img") || link.closest('[class*="cover"], [class*="Cover"]')
-                        ? 20
-                        : 40
-                });
-        }
-
-        // Prefer title next to cover image
-        const cover = document.querySelector(
-            'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
-        );
-        if (cover) {
-            const card = cover.closest("div, article, section, aside") || cover.parentElement;
-            const heading = card?.querySelector("a[href*='/info/'], h1, h2, h3, .anime-title");
-            const text = cleanText(heading?.textContent);
-            if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
-                candidates.push({ text, score: 100 });
-        }
-
+        // v1: dedicated anime title heading
         for (const sel of [
             "h1.anime-title",
             ".anime-title",
@@ -258,11 +304,53 @@
         ]) {
             const text = cleanText(document.querySelector(sel)?.textContent);
             if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
-                candidates.push({ text, score: 50 });
+                candidates.push({ text, score: 120 });
+        }
+
+        // v2 watch page: series title is the h2 in player controls (h1 is episode name)
+        for (const node of document.querySelectorAll(".watch-controls h2")) {
+            const text = cleanText(node.textContent);
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
+                candidates.push({ text, score: 110 });
+        }
+
+        // Prefer title next to cover image (v1 CSS modules)
+        const cover = document.querySelector(
+            'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
+        );
+        if (cover) {
+            const card = cover.closest("div, article, section, aside") || cover.parentElement;
+            const heading = card?.querySelector("a[href*='/info/'], h1.anime-title, .anime-title, h2");
+            const text = cleanText(heading?.textContent);
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
+                candidates.push({ text, score: 100 });
+        }
+
+        // Series title beside the poster (link to /info/...)
+        for (const link of document.querySelectorAll('a[href*="/info/"]')) {
+            const aria = cleanText(link.getAttribute("aria-label") || "").replace(/^About\s+/i, "");
+            const text = cleanText(link.textContent) || aria;
+            if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
+                candidates.push({
+                    text,
+                    score: link.querySelector("img") || link.closest('[class*="cover"], [class*="Cover"]')
+                        ? 60
+                        : 40
+                });
+        }
+
+        // og:title — v2 often has a generic "Miruro" tag plus "Watch Anime Name - Miruro"
+        for (const og of metaContents("og:title")) {
+            const fromOg = cleanText(
+                og.replace(/^Watch\s+/i, "").replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
+            );
+            if (fromOg && !isJunkTitle(fromOg) && !isEpisodeHeading(fromOg))
+                candidates.push({ text: fromOg, score: 30 });
         }
 
         // document.title sometimes: "Anime Name Episode 3 | Miruro"
         const tab = cleanText(document.title)
+            .replace(/^Watch\s+/i, "")
             .replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
             .replace(/\s+Episode\s+\d+.*$/i, "")
             .trim();
@@ -274,23 +362,55 @@
     }
 
     function getCover() {
+        // v1 poster class wins over random /info/ thumbs in side lists
         const preferred = document.querySelector(
-            'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
+            'img[class*="_coverImg_"], img[class*="coverImg"]'
         );
         if (preferred?.currentSrc || preferred?.src)
             return preferred.currentSrc || preferred.src;
 
+        // v2: poster is the /info/ link image beside the player controls
+        const infoCover = document.querySelector(
+            ".watch-controls a[href*='/info/'] img, a[href*='/info/'] img[class*='object-cover']"
+        );
+        if (infoCover?.currentSrc || infoCover?.src)
+            return infoCover.currentSrc || infoCover.src;
+
         const images = [...document.querySelectorAll("img")];
         const match = images.find((img) => {
             const src = img.currentSrc || img.src || "";
+            const cls = String(img.className || "");
+            if (/sideList|banner|avatar/i.test(cls))
+                return false;
             return (
-                /anilist\.co/i.test(src) ||
-                /media\/anime\/cover/i.test(src) ||
-                /\/cover[s]?\//i.test(src)
+                /anilist\.co\/.*\/cover/i.test(src) ||
+                /media\/anime\/cover/i.test(src)
             );
         });
+        if (match)
+            return match.currentSrc || match.src;
 
-        return match ? (match.currentSrc || match.src) : null;
+        const ogImage = metaContents("og:image").find((src) =>
+            /anilist\.co|\/cover/i.test(src)
+        );
+        return ogImage || null;
+    }
+
+    function parseEpisodeNumber(text) {
+        const value = cleanText(text);
+        if (!value)
+            return null;
+
+        const m =
+            value.match(/^Episode\s+(\d+)\b/i) ||
+            value.match(/^Ep\s*(\d+)\b/i) ||
+            value.match(/^(\d+)\.\s+\S/);
+
+        if (!m)
+            return null;
+
+        const ep = Number(m[1]);
+        return Number.isFinite(ep) && ep > 0 ? ep : null;
     }
 
     function getEpisode() {
@@ -298,13 +418,25 @@
         if (Number.isFinite(ep) && ep > 0)
             return ep;
 
+        // v2: primary heading is "Episode N"
+        for (const node of document.querySelectorAll("h1, .watch-controls span")) {
+            const n = parseEpisodeNumber(ownText(node) || node.textContent);
+            if (n)
+                return n;
+        }
+
         const heading = getEpisodeHeadingText();
-        const m = heading?.match(/^(\d+)\./);
-        return m ? Number(m[1]) : 1;
+        const fromHeading = parseEpisodeNumber(heading);
+        if (fromHeading)
+            return fromHeading;
+
+        return 1;
     }
 
     function getEpisodeHeadingText() {
-        const nodes = document.querySelectorAll("h1, h2, h3, h4, [class*='title']");
+        const nodes = document.querySelectorAll(
+            "h1, h2, h3, h4, .watch-controls span, [class*='title']"
+        );
         for (const node of nodes) {
             // Prefer direct text so AUDIO / SERVER sibling controls are ignored.
             const direct = ownText(node);
@@ -312,22 +444,48 @@
             if (!isEpisodeHeading(text) || text.length >= 160)
                 continue;
 
-            const m = text.match(/^(\d+)\.\s*(.+)$/);
-            const title = scrubEpisodeTitle(m?.[2] || "");
-            if (!title)
-                continue;
+            // v1: "6. Title"
+            const dotted = text.match(/^(\d+)\.\s*(.+)$/);
+            if (dotted) {
+                const title = scrubEpisodeTitle(dotted[2] || "");
+                if (!title)
+                    continue;
+                return `${dotted[1]}. ${title}`;
+            }
 
-            return `${m[1]}. ${title}`;
+            // v2: "Episode 1" (optional named title may sit nearby)
+            const plain = text.match(/^Episode\s+(\d+)\b/i) || text.match(/^Ep\s*(\d+)\b/i);
+            if (plain)
+                return `Episode ${plain[1]}`;
         }
         return null;
     }
 
     function getEpisodeTitle(episode) {
+        // v1: dedicated episode title node
+        const epTitle = scrubEpisodeTitle(
+            document.querySelector(".ep-title, [class*='ep-title'], [class*='epTitle']")?.textContent
+        );
+        if (epTitle && !isJunkTitle(epTitle))
+            return epTitle;
+
         const heading = getEpisodeHeadingText();
         if (heading) {
-            const m = heading.match(/^(\d+)\.\s*(.+)$/);
-            if (m && Number(m[1]) === episode)
-                return scrubEpisodeTitle(m[2]);
+            const dotted = heading.match(/^(\d+)\.\s*(.+)$/);
+            if (dotted && Number(dotted[1]) === episode)
+                return scrubEpisodeTitle(dotted[2]);
+        }
+
+        // v2: h1 is the episode name ("Locusts") while ep number lives in ?ep=
+        const h1 = document.querySelector(".watch-controls h1, h1");
+        const h1Text = scrubEpisodeTitle(ownText(h1) || h1?.textContent || "");
+        if (
+            h1Text &&
+            !isJunkTitle(h1Text) &&
+            !isEpisodeHeading(h1Text) &&
+            h1Text.toLowerCase() !== getTitle()?.toLowerCase()
+        ) {
+            return h1Text;
         }
 
         const list = document.querySelector("[data-episode-list]");
@@ -350,7 +508,7 @@
                     raw.match(/^\d+\s+(.+)$/);
 
                 const cleaned = scrubEpisodeTitle(titled?.[1] || text);
-                if (cleaned)
+                if (cleaned && !/^episode\s+\d+\b/i.test(cleaned))
                     return cleaned;
             }
         }
@@ -612,10 +770,24 @@
             return true;
         }
 
+        function resetPlayback() {
+            detachStrmcx();
+            okPlayer = null;
+            last = {
+                currentTime: 0,
+                duration: null,
+                paused: true,
+                updatedAt: 0,
+                movingAt: 0
+            };
+        }
+
         function poll() {
             const strmcx = document.querySelector("strmcx-embed");
             if (strmcx)
                 attachStrmcx(strmcx);
+            else if (strmcxEl)
+                detachStrmcx();
 
             const videoPlayback = readMedia(findVideoDeep(document));
 
@@ -655,6 +827,15 @@
                     duration: clock.duration,
                     paused: Boolean(clock.paused || stalled || holdPause)
                 });
+                return;
+            }
+
+            // Embed iframes own playback on a separate WS client. If the local
+            // player disappeared (e.g. switched to bunembeds), drop stale state
+            // so we don't keep overwriting Embed ticks with a frozen pause.
+            if (!strmcx && !videoPlayback && !okPlayback) {
+                if (last.duration)
+                    resetPlayback();
                 return;
             }
 
@@ -741,10 +922,11 @@
      * After SPA navigation the old anime DOM often lingers briefly.
      * Clear Discord immediately, then wait until title/cover change (or timeout).
      */
-    function schedulePresenceWhenReady(previousTitle, previousCover) {
+    function schedulePresenceWhenReady(previousTitle, previousCover, opts = {}) {
         cancelPresenceWait();
         const expectedKey = getWatchKey();
         const startedAt = Date.now();
+        const sameShow = Boolean(opts.sameShow);
 
         const attempt = () => {
             presenceWaitTimer = null;
@@ -760,8 +942,16 @@
             const titleReady = title && !isJunkTitle(title) && title !== previousTitle;
             const coverReady = cover && cover !== previousCover;
             const firstPaint = !previousTitle && title && !isJunkTitle(title);
+            // Episode-only navigations keep the same title/cover — publish as soon as we have one.
+            const episodeOnlyReady = sameShow && title && !isJunkTitle(title);
 
-            if (firstPaint || titleReady || coverReady || (timedOut && title && !isJunkTitle(title))) {
+            if (
+                firstPaint ||
+                titleReady ||
+                coverReady ||
+                episodeOnlyReady ||
+                (timedOut && title && !isJunkTitle(title))
+            ) {
                 sendPresence();
                 return;
             }
@@ -769,7 +959,7 @@
             presenceWaitTimer = setTimeout(attempt, 150);
         };
 
-        presenceWaitTimer = setTimeout(attempt, 100);
+        presenceWaitTimer = setTimeout(attempt, sameShow ? 50 : 100);
     }
 
     function claim() {
@@ -789,9 +979,22 @@
         if (key !== activeWatchKey) {
             const previousTitle = getTitle();
             const previousCover = getCover();
-            const hadPrevious = Boolean(activeWatchKey);
+            const previousKey = activeWatchKey;
+            const hadPrevious = Boolean(previousKey);
+            const sameShow =
+                hadPrevious &&
+                previousKey.split("|")[0] === key.split("|")[0] &&
+                previousTitle &&
+                !isJunkTitle(previousTitle);
+
             send("clear");
             activeWatchKey = null;
+
+            // Same anime, new episode (or embed server still on this show): title/cover won't change.
+            if (sameShow) {
+                sendPresence();
+                return;
+            }
 
             // Userscript update / first claim: DOM is already painted — don't wait 2.5s.
             if (!hadPrevious && previousTitle && !isJunkTitle(previousTitle)) {
@@ -799,7 +1002,7 @@
                 return;
             }
 
-            schedulePresenceWhenReady(previousTitle, previousCover);
+            schedulePresenceWhenReady(previousTitle, previousCover, { sameShow });
             return;
         }
 
@@ -869,6 +1072,15 @@
                 sendPresence();
             }, PRESENCE_MS);
 
+            // Push our tab id into player iframes (bunembeds/megaplay/etc.) so they
+            // can connect even if their document-start ping was missed.
+            announceTabIdToFrames();
+            setInterval(announceTabIdToFrames, 2000);
+            new MutationObserver(announceTabIdToFrames).observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+
             hookHistory("pushState");
             hookHistory("replaceState");
             window.addEventListener("popstate", onNavigation);
@@ -886,17 +1098,32 @@
 
     // ── Embed client (cross-origin iframes) ────────────────────────────
 
+    function relayPlaybackToParent(playback) {
+        try {
+            window.parent.postMessage({
+                type: "miruro-rpc-playback",
+                currentTime: playback.currentTime,
+                duration: playback.duration,
+                paused: Boolean(playback.paused)
+            }, "*");
+        } catch { /* ignore */ }
+    }
+
     function startEmbedClient() {
-        if (embedReady || IS_MIRURO)
+        if (embedReady || IS_MIRURO || !IS_FRAME)
             return;
 
         embedReady = true;
 
-        connect("Embed", () => {
-            createPlaybackTracker((playback) => {
-                send("playback", playback);
-            });
+        // Track immediately and relay via postMessage. Do NOT wait for a
+        // localhost WebSocket — megaplay/etc. often can't open ws://127.0.0.1.
+        createPlaybackTracker((playback) => {
+            relayPlaybackToParent(playback);
+            send("playback", playback);
         });
+
+        // Optional direct bridge connection (works when the host allows it).
+        connect("Embed", () => {});
     }
 
     // ── boot ───────────────────────────────────────────────────────────

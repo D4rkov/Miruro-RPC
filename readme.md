@@ -33,7 +33,7 @@ It starts with Windows by default and checks for updates automatically.
 
 ### 3. Watch anime
 
-Open [Miruro](https://www.miruro.tv), play an episode, check Discord.
+Open [Miruro 2.0](https://barelystarted.miruro.tv) (or [miruro.tv](https://www.miruro.tv)), play an episode, check Discord.
 
 ---
 

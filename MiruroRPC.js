@@ -6,7 +6,7 @@ const PORT = 3847;
 const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
 const WS_HEARTBEAT_MS = 30000;
-const VERSION = "2.1.9";
+const VERSION = "2.2.0";
 
 const DEBUG = process.argv.includes("--debug");
 
@@ -290,10 +290,15 @@ function wireSocketServer(server) {
                         emitStatus();
                         break;
                     case "playback":
-                        // Only the focused watch tab (same id) may update playback.
-                        if (data.id === ownerId && pageMode === "watch") {
+                        // Only the focused Miruro tab (same id) may update playback.
+                        // Accept ticks even during the brief clear→presence gap so
+                        // embed iframes don't lose progress while metadata catches up.
+                        if (data.id === ownerId) {
                             setPlayback(data);
-                            updateActivity();
+                            if (pageMode === "watch")
+                                updateActivity();
+                            else
+                                debug("Playback buffered (waiting for presence).", data);
                         }
                         break;
                     case "clear":
@@ -574,6 +579,7 @@ function applyTimestamps(activity, data) {
     const currentTime = Math.max(0, Math.min(data.currentTime, data.duration));
 
     if (data.paused) {
+        // start === end → Discord shows a frozen 00:00 / 00:00 bar
         activity.state = `❚❚ ${activity.state}`;
         const now = Math.floor(Date.now() / 1000);
         activity.timestamps = { start: now, end: now };
