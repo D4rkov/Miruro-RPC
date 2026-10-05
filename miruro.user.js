@@ -26,6 +26,10 @@
     const OPEN_TIMEOUT_MS = 5000;
     const RECONNECT_MS = 500;
 
+    // Top-level non-Miruro pages never talk to the bridge.
+    if (!IS_MIRURO && !IS_FRAME)
+        return;
+
     let tabId = crypto.randomUUID();
     let socket = null;
     let reconnectTimer = null;
@@ -39,6 +43,16 @@
     // ── messaging / tab identity (Miruro ↔ embed iframes) ───────────────
 
     const pendingChildren = new Set();
+
+    function isEmbeddedFrameSource(source) {
+        if (!source || source === window)
+            return false;
+        try {
+            return source.top === window;
+        } catch {
+            return false;
+        }
+    }
 
     function announceTabIdToFrames() {
         if (!IS_MIRURO)
@@ -62,6 +76,8 @@
     window.addEventListener("message", (event) => {
         if (event.data === "miruro-rpc-id-request") {
             if (IS_MIRURO) {
+                if (!isEmbeddedFrameSource(event.source))
+                    return;
                 event.source?.postMessage({ type: "miruro-rpc-id", id: tabId }, "*");
                 return;
             }
@@ -75,6 +91,8 @@
         // Embed iframes relay playback here so they don't need ws://127.0.0.1
         // (third-party hosts often block private-network WebSockets).
         if (IS_MIRURO && event.data?.type === "miruro-rpc-playback") {
+            if (!isEmbeddedFrameSource(event.source))
+                return;
             if (!isFocusedMiruroTab() || !isWatchPage())
                 return;
 
@@ -92,6 +110,9 @@
         }
 
         if (event.data?.type !== "miruro-rpc-id")
+            return;
+
+        if (IS_FRAME && event.source !== window.parent)
             return;
 
         tabId = event.data.id;

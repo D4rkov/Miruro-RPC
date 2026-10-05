@@ -7,8 +7,72 @@ const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
 const WS_HEARTBEAT_MS = 30000;
 const VERSION = "2.2.0";
+const CLIENT_TYPES = new Set(["Miruro", "Embed"]);
+const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const DEBUG = process.argv.includes("--debug");
+
+function isMiruroHostname(hostname) {
+    return /(^|\.)miruro\./i.test(String(hostname || ""));
+}
+
+function isAllowedWsOrigin(origin) {
+    if (!origin || origin === "null")
+        return true;
+    try {
+        const url = new URL(origin);
+        if (url.protocol === "chrome-extension:" || url.protocol === "moz-extension:")
+            return true;
+        return isMiruroHostname(url.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function isValidId(id) {
+    return typeof id === "string" && ID_RE.test(id);
+}
+
+function sanitizeWatchUrl(value) {
+    if (typeof value !== "string" || !value)
+        return null;
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:" || !isMiruroHostname(url.hostname))
+            return null;
+        url.hash = "";
+        url.username = "";
+        url.password = "";
+        return url.toString();
+    } catch {
+        return null;
+    }
+}
+
+function sanitizeCover(value) {
+    if (typeof value !== "string" || !value)
+        return null;
+    if (/^[a-z0-9_-]{1,64}$/i.test(value))
+        return value;
+    try {
+        const url = new URL(value);
+        if (url.protocol !== "https:")
+            return null;
+        const host = url.hostname.toLowerCase();
+        if (
+            host === "anilist.co" ||
+            host.endsWith(".anilist.co") ||
+            isMiruroHostname(host) ||
+            /\/media\/anime\/cover\//i.test(url.pathname) ||
+            /\/cover\/(large|medium)\//i.test(url.pathname)
+        ) {
+            return url.toString();
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
 
 let wss = null;
 let started = false;
@@ -70,7 +134,11 @@ function start() {
     info(`MiruroRPC v${VERSION}`);
     info(`Listening on ws://127.0.0.1:${PORT}`);
 
-    wss = new WebSocket.Server({ host: "127.0.0.1", port: PORT });
+    wss = new WebSocket.Server({
+        host: "127.0.0.1",
+        port: PORT,
+        verifyClient: (req) => isAllowedWsOrigin(req.origin)
+    });
     wireSocketServer(wss);
 
     RPC.register(APPLICATION_ID);
@@ -250,18 +318,28 @@ function wireSocketServer(server) {
         ws.on("message", (raw) => {
             try {
                 const data = JSON.parse(raw.toString());
+                if (!data || typeof data !== "object")
+                    return;
                 debug("[RX]", data.type, data);
+
+                if (data.type !== "hello" && !ws.authed)
+                    return;
 
                 switch (data.type) {
                     case "hello":
+                        if (!CLIENT_TYPES.has(data.client) || !isValidId(data.id))
+                            break;
                         ws.client = data.client;
                         ws.id = data.id;
-                        if (ws.client === "Miruro" && ws.id)
+                        ws.authed = true;
+                        if (ws.client === "Miruro")
                             miruroClients.add(ws.id);
                         info(`${ws.client} connected.`);
                         emitStatus();
                         break;
                     case "claim":
+                        if (ws.client !== "Miruro" || !isValidId(data.id))
+                            break;
                         // Focused Miruro tab takes ownership. Wait for browse/presence next.
                         cancelFocusClear();
                         ownerId = data.id;
@@ -272,7 +350,7 @@ function wireSocketServer(server) {
                         emitStatus();
                         break;
                     case "browse":
-                        if (data.id !== ownerId)
+                        if (ws.client !== "Miruro" || data.id !== ownerId)
                             break;
                         cancelFocusClear();
                         clearTab(data.id);
@@ -281,7 +359,7 @@ function wireSocketServer(server) {
                         emitStatus();
                         break;
                     case "presence":
-                        if (data.id !== ownerId)
+                        if (ws.client !== "Miruro" || data.id !== ownerId)
                             break;
                         cancelFocusClear();
                         setPresence(data);
@@ -303,7 +381,7 @@ function wireSocketServer(server) {
                         break;
                     case "clear":
                         // SPA transition — drop stale anime immediately.
-                        if (data.id !== ownerId)
+                        if (ws.client !== "Miruro" || data.id !== ownerId)
                             break;
                         cancelFocusClear();
                         clearTab(data.id);
@@ -315,11 +393,11 @@ function wireSocketServer(server) {
                         break;
                     case "hidden":
                         // Focused tab lost focus — clear shortly unless another Miruro tab claims.
-                        if (data.id === ownerId)
+                        if (ws.client === "Miruro" && data.id === ownerId)
                             scheduleFocusClear();
                         break;
                     case "leave":
-                        if (ws.id)
+                        if (ws.client === "Miruro" && ws.id)
                             releaseMiruroTab(ws.id);
                         break;
                 }
@@ -551,24 +629,30 @@ function createWatchActivity(data) {
             state = `${prefix}${episodeTitle}${suffix}`;
     }
 
-    return {
+    const activity = {
         application_id: APPLICATION_ID,
         name: "Anime on Miruro! ッ",
         details,
         state,
-        type: 3,
-        buttons: [
+        type: 3
+    };
+
+    const watchUrl = sanitizeWatchUrl(data.url);
+    if (watchUrl) {
+        activity.buttons = [
             {
                 label: "Watch on Miruro! ッ",
-                url: data.url
+                url: watchUrl
             }
-        ]
-    };
+        ];
+    }
+
+    return activity;
 }
 
 function applyAssets(activity, data) {
     activity.assets = {
-        large_image: data.cover || "miruro",
+        large_image: sanitizeCover(data.cover) || "miruro",
         large_text: data.title || "Miruro",
         small_image: "miruro",
         small_text: "Miruro"
