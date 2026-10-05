@@ -17,14 +17,18 @@
 (() => {
     "use strict";
 
+    const SCRIPT_VERSION = "2.2.0";
     const PORT = 3847;
     const BRIDGE_URL = `ws://127.0.0.1:${PORT}`;
+    const FALLBACK_SCRIPT_URL =
+        "https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
     const IS_MIRURO = /(^|\.)miruro\./i.test(location.hostname);
     const IS_FRAME = window !== window.top;
     const PRESENCE_MS = 4000;
     const PLAYBACK_MS = 1000;
     const OPEN_TIMEOUT_MS = 5000;
     const RECONNECT_MS = 500;
+    const UPDATE_NUDGE_KEY = "mirurorpc:update-nudge";
 
     // Top-level non-Miruro pages never talk to the bridge.
     if (!IS_MIRURO && !IS_FRAME)
@@ -143,6 +147,153 @@
 
     // ── bridge ─────────────────────────────────────────────────────────
 
+    function parseSemver(version) {
+        const parts = String(version || "")
+            .replace(/^v/i, "")
+            .split(".")
+            .map((n) => Number(n));
+        if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n)))
+            return null;
+        return parts;
+    }
+
+    function cmpSemver(a, b) {
+        const pa = parseSemver(a);
+        const pb = parseSemver(b);
+        if (!pa || !pb)
+            return 0;
+        for (let i = 0; i < 3; i++) {
+            if (pa[i] !== pb[i])
+                return pa[i] - pb[i];
+        }
+        return 0;
+    }
+
+    function isSafeScriptUrl(value) {
+        if (typeof value !== "string" || !value)
+            return false;
+        try {
+            const url = new URL(value);
+            if (url.protocol === "http:" && url.hostname === "127.0.0.1" && url.port === String(PORT)) {
+                const token = url.searchParams.get("token") || "";
+                return url.pathname === "/miruro.user.js" && /^[0-9a-f]{32}$/i.test(token);
+            }
+            if (url.protocol === "https:" && url.hostname === "github.com")
+                return url.pathname === "/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
+            if (url.protocol === "https:" && url.hostname === "raw.githubusercontent.com")
+                return url.pathname === "/D4rkov/Miruro-RPC/main/miruro.user.js";
+            return false;
+        } catch {
+            return false;
+        }
+    }
+
+    function showUpdateNudge(bridgeVersion, scriptUrl) {
+        if (!IS_MIRURO || IS_FRAME)
+            return;
+
+        const url = isSafeScriptUrl(scriptUrl) ? scriptUrl : FALLBACK_SCRIPT_URL;
+        const seenKey = `${UPDATE_NUDGE_KEY}:${bridgeVersion}`;
+        try {
+            if (sessionStorage.getItem(seenKey) === "1")
+                return;
+            sessionStorage.setItem(seenKey, "1");
+        } catch { /* private mode */ }
+
+        if (document.getElementById("mirurorpc-update-nudge"))
+            return;
+
+        const mount = () => {
+            if (document.getElementById("mirurorpc-update-nudge"))
+                return;
+
+            const bar = document.createElement("div");
+            bar.id = "mirurorpc-update-nudge";
+            bar.setAttribute("role", "status");
+            Object.assign(bar.style, {
+                position: "fixed",
+                left: "16px",
+                right: "16px",
+                bottom: "16px",
+                zIndex: "2147483647",
+                display: "flex",
+                gap: "12px",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "12px 14px",
+                borderRadius: "10px",
+                background: "rgba(12, 14, 18, 0.92)",
+                color: "#f4f6f8",
+                font: "500 13px/1.35 Segoe UI, system-ui, sans-serif",
+                boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+                backdropFilter: "blur(8px)"
+            });
+
+            const text = document.createElement("div");
+            text.textContent =
+                `MiruroRPC userscript is behind the bridge (v${SCRIPT_VERSION} → v${bridgeVersion}). Update in Tampermonkey.`;
+
+            const actions = document.createElement("div");
+            Object.assign(actions.style, {
+                display: "flex",
+                gap: "8px",
+                flexShrink: "0"
+            });
+
+            const updateBtn = document.createElement("button");
+            updateBtn.type = "button";
+            updateBtn.textContent = "Update script";
+            Object.assign(updateBtn.style, {
+                cursor: "pointer",
+                border: "0",
+                borderRadius: "8px",
+                padding: "8px 12px",
+                background: "#5b8cff",
+                color: "#fff",
+                font: "600 12px/1 Segoe UI, system-ui, sans-serif"
+            });
+            updateBtn.addEventListener("click", () => {
+                window.open(url, "_blank", "noopener,noreferrer");
+            });
+
+            const dismissBtn = document.createElement("button");
+            dismissBtn.type = "button";
+            dismissBtn.textContent = "Later";
+            Object.assign(dismissBtn.style, {
+                cursor: "pointer",
+                border: "1px solid rgba(255,255,255,0.2)",
+                borderRadius: "8px",
+                padding: "8px 12px",
+                background: "transparent",
+                color: "#f4f6f8",
+                font: "600 12px/1 Segoe UI, system-ui, sans-serif"
+            });
+            dismissBtn.addEventListener("click", () => bar.remove());
+
+            actions.append(updateBtn, dismissBtn);
+            bar.append(text, actions);
+            (document.body || document.documentElement).appendChild(bar);
+        };
+
+        if (document.body)
+            mount();
+        else
+            document.addEventListener("DOMContentLoaded", mount, { once: true });
+    }
+
+    function onBridgeMessage(raw) {
+        let data;
+        try {
+            data = JSON.parse(raw.data);
+        } catch {
+            return;
+        }
+        if (!data || data.type !== "hello" || typeof data.version !== "string")
+            return;
+        if (cmpSemver(data.version, SCRIPT_VERSION) > 0)
+            showUpdateNudge(data.version, data.scriptUrl);
+    }
+
     function send(type, data = {}) {
         if (socket?.readyState !== WebSocket.OPEN)
             return false;
@@ -204,6 +355,12 @@
             clearOpenTimer();
             send("hello", { client });
             onOpen();
+        });
+
+        s.addEventListener("message", (event) => {
+            if (socket !== s)
+                return;
+            onBridgeMessage(event);
         });
 
         s.addEventListener("close", () => {

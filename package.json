@@ -24,12 +24,12 @@
   },
   "dependencies": {
     "discord-rpc": "^4.0.1",
-    "electron-updater": "^6.8.9",
-    "ws": "^8.21.0"
+    "electron-updater": "^6.8.10",
+    "ws": "^8.22.0"
   },
   "devDependencies": {
-    "electron": "^44.3.0",
-    "electron-builder": "^26.15.3"
+    "electron": "^44.5.1",
+    "electron-builder": "^26.17.0"
   },
   "build": {
     "appId": "com.darkov.mirurorpc",

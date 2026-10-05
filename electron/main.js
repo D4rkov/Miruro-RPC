@@ -14,7 +14,8 @@ const { autoUpdater } = require("electron-updater");
 
 const bridge = require("../MiruroRPC");
 
-const USERSCRIPT_INSTALL_URL =
+const FALLBACK_USERSCRIPT_URL =
+    bridge.GITHUB_USERSCRIPT_URL ||
     "https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
 const TAMPERMONKEY_URL = "https://www.tampermonkey.net/";
 const RELEASES_URL = "https://github.com/D4rkov/Miruro-RPC/releases";
@@ -24,6 +25,33 @@ let tray = null;
 let quitting = false;
 let updateState = "idle"; // idle | checking | available | downloaded | error
 let latestVersion = null;
+
+function settingsPath() {
+    return path.join(app.getPath("userData"), "settings.json");
+}
+
+function readSettings() {
+    try {
+        return JSON.parse(fs.readFileSync(settingsPath(), "utf8"));
+    } catch {
+        return {};
+    }
+}
+
+function writeSettings(settings) {
+    try {
+        fs.writeFileSync(settingsPath(), JSON.stringify(settings, null, 2));
+    } catch { /* ignore */ }
+}
+
+function userscriptInstallUrl() {
+    try {
+        const status = bridge.getStatus();
+        if (status.listening && typeof status.scriptUrl === "string" && status.scriptUrl)
+            return status.scriptUrl;
+    } catch { /* ignore */ }
+    return FALLBACK_USERSCRIPT_URL;
+}
 
 function iconPath() {
     return path.join(__dirname, "..", "assets", "icon.png");
@@ -157,13 +185,17 @@ function rebuildMenu() {
 }
 
 async function installUserscript() {
+    const url = userscriptInstallUrl();
+    const local = url.startsWith("http://127.0.0.1:");
     const { response } = await dialog.showMessageBox({
         type: "question",
         title: "Install userscript",
         message: "Install the MiruroRPC userscript?",
         detail:
             "Needs Tampermonkey in your browser.\n" +
-            "If you already have it, choose Install script.",
+            (local
+                ? "Opens the script from this app so it matches the bridge version."
+                : "Bridge port unavailable — opens the GitHub userscript instead."),
         buttons: ["Install script", "Get Tampermonkey", "Cancel"],
         defaultId: 0,
         cancelId: 2,
@@ -171,9 +203,27 @@ async function installUserscript() {
     });
 
     if (response === 0)
-        await shell.openExternal(USERSCRIPT_INSTALL_URL);
+        await shell.openExternal(url);
     else if (response === 1)
         await shell.openExternal(TAMPERMONKEY_URL);
+}
+
+async function nudgeUserscriptAfterAppUpdate(version) {
+    const { response } = await dialog.showMessageBox({
+        type: "info",
+        title: "Update userscript too",
+        message: `MiruroRPC v${version} is ready.`,
+        detail:
+            "Tampermonkey does not update automatically with the tray app.\n" +
+            "Open the matching userscript so Tampermonkey can install/update it.",
+        buttons: ["Update userscript", "Later"],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true
+    });
+
+    if (response === 0)
+        await shell.openExternal(userscriptInstallUrl());
 }
 
 function notify(title, body) {
@@ -248,7 +298,7 @@ function createTray() {
     rebuildMenu();
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
     if (process.platform === "win32")
         app.setAppUserModelId("com.darkov.mirurorpc");
 
@@ -265,7 +315,7 @@ app.whenReady().then(() => {
     });
 
     bridge.onStatus(() => rebuildMenu());
-    bridge.start();
+    await bridge.start();
 
     powerMonitor.on("resume", () => {
         try {
@@ -278,18 +328,24 @@ app.whenReady().then(() => {
 
     // Default to start with Windows on first packaged run
     if (app.isPackaged && !app.getLoginItemSettings().wasOpenedAtLogin) {
-        const storePath = path.join(app.getPath("userData"), "settings.json");
-        let settings = {};
-        try {
-            settings = JSON.parse(fs.readFileSync(storePath, "utf8"));
-        } catch { /* first run */ }
-
+        const settings = readSettings();
         if (settings.openAtLogin == null) {
             setOpenAtLogin(true);
             settings.openAtLogin = true;
-            try {
-                fs.writeFileSync(storePath, JSON.stringify(settings, null, 2));
-            } catch { /* ignore */ }
+            writeSettings(settings);
+        }
+    }
+
+    // After an installed update, remind once that Tampermonkey is separate.
+    if (app.isPackaged) {
+        const version = app.getVersion();
+        const settings = readSettings();
+        const previous = settings.lastRunningVersion;
+        if (previous !== version) {
+            settings.lastRunningVersion = version;
+            writeSettings(settings);
+            if (previous)
+                nudgeUserscriptAfterAppUpdate(version);
         }
     }
 

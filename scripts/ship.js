@@ -119,6 +119,10 @@ function syncVersionFiles(version) {
     /^\/\/ @version\s+.+$/m,
     `// @version      ${version}`
   );
+  userscript = userscript.replace(
+    /const SCRIPT_VERSION = "[^"]+";/,
+    `const SCRIPT_VERSION = "${version}";`
+  );
   fs.writeFileSync(userPath, userscript);
 }
 

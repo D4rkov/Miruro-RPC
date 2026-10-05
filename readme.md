@@ -76,7 +76,7 @@ Maintaining a whitelist of every provider isn’t practical — providers change
 
 ### Does the tray app update the userscript too?
 
-No — Tampermonkey updates the script via `@updateURL`. The tray app updates itself via GitHub Releases.
+Not by itself — Tampermonkey is separate from the tray auto-updater. After a tray update you’ll get a one-time prompt to open the matching userscript. When the bridge owns its local port, that link is a tokenized localhost URL; if the port is unavailable it falls back to GitHub. On Miruro, an older script also shows an update banner when the bridge version is newer. Tampermonkey’s own `@updateURL` checks still work in the background.
 
 ---
 

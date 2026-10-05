@@ -1,3 +1,6 @@
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const WebSocket = require("ws");
 const RPC = require("discord-rpc");
 const crypto = require("crypto");
@@ -7,8 +10,12 @@ const APPLICATION_ID = "1521597072434794527";
 const BROWSE_TICK_MS = 2500;
 const WS_HEARTBEAT_MS = 30000;
 const VERSION = "2.2.0";
+const USERSCRIPT_ROUTE = "/miruro.user.js";
+const GITHUB_USERSCRIPT_URL =
+    "https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js";
 const CLIENT_TYPES = new Set(["Miruro", "Embed"]);
 const ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TOKEN_RE = /^[0-9a-f]{32}$/i;
 
 const DEBUG = process.argv.includes("--debug");
 
@@ -74,8 +81,11 @@ function sanitizeCover(value) {
     }
 }
 
+let httpServer = null;
 let wss = null;
 let started = false;
+let listening = false;
+let installToken = null;
 let ownerId = null;
 let pageMode = null; // "watch" | "browse" | null
 let focusClearTimer = null;
@@ -109,11 +119,36 @@ function emitStatus() {
         statusListener(getStatus());
 }
 
+function userscriptFilePath() {
+    const candidates = [
+        path.join(__dirname, "miruro.user.js"),
+        path.join(process.resourcesPath || "", "miruro.user.js")
+    ];
+    for (const file of candidates) {
+        try {
+            if (file && fs.existsSync(file))
+                return file;
+        } catch { /* ignore */ }
+    }
+    return candidates[0];
+}
+
+function isBound() {
+    return Boolean(listening && httpServer && httpServer.listening && installToken);
+}
+
+function scriptInstallUrl() {
+    if (!isBound())
+        return GITHUB_USERSCRIPT_URL;
+    return `http://127.0.0.1:${PORT}${USERSCRIPT_ROUTE}?token=${installToken}`;
+}
+
 function getStatus() {
     return {
         version: VERSION,
-        listening: Boolean(wss),
+        listening: isBound(),
         port: PORT,
+        scriptUrl: scriptInstallUrl(),
         discord: rpcReady,
         clients: clients.size,
         miruro: miruroClients.size,
@@ -122,29 +157,144 @@ function getStatus() {
     };
 }
 
+function sendJson(ws, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN)
+        return;
+    try {
+        ws.send(JSON.stringify(payload));
+    } catch { /* ignore */ }
+}
+
+function isLocalScriptHost(hostHeader) {
+    if (!hostHeader || typeof hostHeader !== "string")
+        return false;
+    const host = hostHeader.toLowerCase();
+    return host === `127.0.0.1:${PORT}` || host === "127.0.0.1";
+}
+
+function tokensMatch(provided, expected) {
+    if (!TOKEN_RE.test(provided) || !TOKEN_RE.test(expected))
+        return false;
+    const a = Buffer.from(provided);
+    const b = Buffer.from(expected);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+function serveUserscript(req, res) {
+    if (!isBound() || !isLocalScriptHost(req.headers.host)) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Not found");
+        return;
+    }
+
+    const url = new URL(req.url || "/", `http://127.0.0.1:${PORT}`);
+    const token = url.searchParams.get("token") || "";
+    if (url.pathname !== USERSCRIPT_ROUTE || !tokensMatch(token, installToken)) {
+        res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Not found");
+        return;
+    }
+
+    const file = userscriptFilePath();
+    fs.readFile(file, (err, body) => {
+        if (err) {
+            res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+            res.end(req.method === "HEAD" ? undefined : "Userscript not found");
+            return;
+        }
+
+        res.writeHead(200, {
+            "Content-Type": "text/javascript; charset=utf-8",
+            "Cache-Control": "no-store",
+            "Content-Length": Buffer.byteLength(body)
+        });
+        res.end(req.method === "HEAD" ? undefined : body);
+    });
+}
+
+function teardownServer() {
+    if (wss) {
+        try {
+            wss.close();
+        } catch { /* ignore */ }
+        wss = null;
+    }
+    if (httpServer) {
+        try {
+            httpServer.close();
+        } catch { /* ignore */ }
+        httpServer = null;
+    }
+    listening = false;
+    installToken = null;
+}
+
 function onStatus(listener) {
     statusListener = listener;
 }
 
 function start() {
     if (started)
-        return getStatus();
+        return Promise.resolve(getStatus());
 
     started = true;
+    listening = false;
+    installToken = null;
     info(`MiruroRPC v${VERSION}`);
-    info(`Listening on ws://127.0.0.1:${PORT}`);
+
+    httpServer = http.createServer((req, res) => {
+        if (req.method === "GET" || req.method === "HEAD") {
+            serveUserscript(req, res);
+            return;
+        }
+        res.writeHead(405, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Method not allowed");
+    });
 
     wss = new WebSocket.Server({
-        host: "127.0.0.1",
-        port: PORT,
+        server: httpServer,
         verifyClient: (req) => isAllowedWsOrigin(req.origin)
     });
     wireSocketServer(wss);
 
     RPC.register(APPLICATION_ID);
     connectRPC();
-    emitStatus();
-    return getStatus();
+
+    return new Promise((resolve) => {
+        const onListening = () => {
+            cleanupListenWait();
+            listening = true;
+            installToken = crypto.randomBytes(16).toString("hex");
+            httpServer.on("error", (err) => {
+                console.error("HTTP server error:", err.message);
+                listening = false;
+                installToken = null;
+                emitStatus();
+            });
+            info(`Listening on ws://127.0.0.1:${PORT}`);
+            info(`Userscript: ${scriptInstallUrl()}`);
+            emitStatus();
+            resolve(getStatus());
+        };
+
+        const onError = (err) => {
+            cleanupListenWait();
+            console.error(`Failed to bind 127.0.0.1:${PORT}:`, err.message);
+            teardownServer();
+            info(`Userscript fallback: ${GITHUB_USERSCRIPT_URL}`);
+            emitStatus();
+            resolve(getStatus());
+        };
+
+        const cleanupListenWait = () => {
+            httpServer.off("listening", onListening);
+            httpServer.off("error", onError);
+        };
+
+        httpServer.once("listening", onListening);
+        httpServer.once("error", onError);
+        httpServer.listen(PORT, "127.0.0.1");
+    });
 }
 
 function stop() {
@@ -168,13 +318,7 @@ function stop() {
     ownerId = null;
     pageMode = null;
 
-    if (wss) {
-        try {
-            wss.close();
-        } catch { /* ignore */ }
-        wss = null;
-    }
-
+    teardownServer();
     destroyRPC();
     rpcReady = false;
     started = false;
@@ -334,6 +478,11 @@ function wireSocketServer(server) {
                         ws.authed = true;
                         if (ws.client === "Miruro")
                             miruroClients.add(ws.id);
+                        sendJson(ws, {
+                            type: "hello",
+                            version: VERSION,
+                            scriptUrl: scriptInstallUrl()
+                        });
                         info(`${ws.client} connected.`);
                         emitStatus();
                         break;
@@ -803,22 +952,29 @@ function clearActivity() {
     lastActivityKey = null;
     lastWatchSnapshot = null;
 
-    if (!rpc)
+    if (!rpc || !rpcReady)
         return;
 
-    rpc.clearActivity().catch((err) => {
-        console.error("Failed to clear activity:", err.message);
-    });
+    try {
+        rpc.clearActivity().catch((err) => {
+            debug("Failed to clear activity:", err.message);
+        });
+    } catch (err) {
+        debug("Failed to clear activity:", err.message);
+    }
 }
 
 module.exports = {
     PORT,
     VERSION,
+    USERSCRIPT_ROUTE,
+    GITHUB_USERSCRIPT_URL,
     start,
     stop,
     getStatus,
     onStatus,
-    handleResume
+    handleResume,
+    scriptInstallUrl
 };
 
 if (require.main === module)
