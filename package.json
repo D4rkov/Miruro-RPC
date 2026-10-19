@@ -18,6 +18,7 @@
     "start": "node MiruroRPC.js",
     "app": "electron .",
     "dist": "electron-builder --win",
+    "dist:mac": "electron-builder --mac",
     "pack": "electron-builder --dir",
     "ship": "node scripts/ship.js",
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -80,6 +81,35 @@
       "shortcutName": "MiruroRPC",
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.entertainment",
+      "icon": "assets/icon.png",
+      "artifactName": "MiruroRPC-${version}-${arch}.${ext}",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "dmg": {
+      "artifactName": "MiruroRPC-${version}-${arch}.${ext}"
     }
   }
 }

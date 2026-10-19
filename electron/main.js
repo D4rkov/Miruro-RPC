@@ -62,7 +62,9 @@ function loadTrayIcon() {
     let image = nativeImage.createFromPath(file);
     if (image.isEmpty())
         image = nativeImage.createEmpty();
-    return image.resize({ width: 16, height: 16 });
+    // Menu bar / notification area — slightly larger on macOS status item.
+    const size = process.platform === "darwin" ? 18 : 16;
+    return image.resize({ width: size, height: size });
 }
 
 function userscriptPath() {
@@ -76,12 +78,24 @@ function isOpenAtLogin() {
 }
 
 function setOpenAtLogin(enabled) {
-    app.setLoginItemSettings({
+    const settings = {
         openAtLogin: enabled,
-        openAsHidden: true,
-        path: process.execPath,
-        args: app.isPackaged ? [] : [path.resolve(__dirname, "..")]
-    });
+        openAsHidden: true
+    };
+    // path/args are Windows-oriented; macOS uses Launch Services.
+    if (process.platform === "win32") {
+        settings.path = process.execPath;
+        settings.args = app.isPackaged ? [] : [path.resolve(__dirname, "..")];
+    }
+    app.setLoginItemSettings(settings);
+}
+
+function startAtLoginLabel() {
+    if (process.platform === "darwin")
+        return "Start at login";
+    if (process.platform === "win32")
+        return "Start with Windows";
+    return "Start at login";
 }
 
 function statusLabel(status) {
@@ -150,7 +164,7 @@ function rebuildMenu() {
         },
         { type: "separator" },
         {
-            label: "Start with Windows",
+            label: startAtLoginLabel(),
             type: "checkbox",
             checked: openAtLogin,
             click: (item) => setOpenAtLogin(item.checked)
@@ -293,14 +307,21 @@ function debugUpdater(...args) {
 function createTray() {
     tray = new Tray(loadTrayIcon());
     tray.setToolTip("MiruroRPC");
-    tray.on("click", () => tray.popUpContextMenu());
-    tray.on("right-click", () => tray.popUpContextMenu());
+    // Windows: left/right click open the menu. macOS: status item already opens on click.
+    if (process.platform !== "darwin") {
+        tray.on("click", () => tray.popUpContextMenu());
+        tray.on("right-click", () => tray.popUpContextMenu());
+    }
     rebuildMenu();
 }
 
 app.whenReady().then(async () => {
     if (process.platform === "win32")
         app.setAppUserModelId("com.darkov.mirurorpc");
+
+    // Tray-only — hide the Dock icon on macOS.
+    if (process.platform === "darwin" && app.dock)
+        app.dock.hide();
 
     // Single instance — second launch just focuses tray UX
     const gotLock = app.requestSingleInstanceLock();
@@ -326,7 +347,7 @@ app.whenReady().then(async () => {
     createTray();
     setupAutoUpdater();
 
-    // Default to start with Windows on first packaged run
+    // Default to start at login on first packaged run
     if (app.isPackaged && !app.getLoginItemSettings().wasOpenedAtLogin) {
         const settings = readSettings();
         if (settings.openAtLogin == null) {

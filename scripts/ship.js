@@ -6,7 +6,7 @@
  * - Commits any pending work (do NOT bump versions by hand)
  * - Bumps from the latest git tag (patch by default; or: npm run ship -- minor|major)
  * - Syncs package.json / userscript / bridge to that version
- * - Pushes commit + tag → GitHub Actions builds & publishes the .exe
+ * - Pushes commit + tag → GitHub Actions builds & publishes Windows + macOS
  */
 
 const { execSync } = require("child_process");
@@ -197,13 +197,13 @@ run("git add package.json package-lock.json MiruroRPC.js miruro.user.js");
 run(`git commit -m "release: v${next}"`);
 run(`git tag v${next}`);
 
-console.log("\nPushing commit + tag (GitHub Actions will build the .exe)…\n");
+console.log("\nPushing commit + tag (GitHub Actions will build Windows + macOS)…\n");
 run("git push");
 run("git push --tags");
 
 console.log(`
 Done.
-- GitHub Actions → builds MiruroRPC-Setup-${next}.exe and publishes the Release
+- GitHub Actions → builds MiruroRPC-Setup-${next}.exe + MiruroRPC-${next}-*.dmg/zip and publishes the Release
 - Userscript @version is ${next} (Tampermonkey will pick it up from main)
 - Installed tray apps will auto-update from the new Release
 `);

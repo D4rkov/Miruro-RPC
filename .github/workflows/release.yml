@@ -9,8 +9,18 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            builder_args: --win
+          - os: macos-latest
+            platform: mac
+            builder_args: --mac
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -28,7 +38,46 @@ jobs:
       - name: Build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --win --publish never
+        run: npx electron-builder ${{ matrix.builder_args }} --publish never
+
+      - name: Upload Windows artifacts
+        if: matrix.platform == 'win'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/MiruroRPC-Setup-*.exe
+            dist/MiruroRPC-Setup-*.exe.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+
+      - name: Upload macOS artifacts
+        if: matrix.platform == 'mac'
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            dist/MiruroRPC-*.dmg
+            dist/MiruroRPC-*.zip
+            dist/MiruroRPC-*.zip.blockmap
+            dist/latest-mac.yml
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: release
+
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos
+          path: release
 
       - name: Publish single GitHub Release
         uses: softprops/action-gh-release@v3
@@ -39,8 +88,12 @@ jobs:
           make_latest: true
           fail_on_unmatched_files: true
           files: |
-            dist/MiruroRPC-Setup-*.exe
-            dist/MiruroRPC-Setup-*.exe.blockmap
-            dist/latest.yml
+            release/MiruroRPC-Setup-*.exe
+            release/MiruroRPC-Setup-*.exe.blockmap
+            release/latest.yml
+            release/MiruroRPC-*.dmg
+            release/MiruroRPC-*.zip
+            release/MiruroRPC-*.zip.blockmap
+            release/latest-mac.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
