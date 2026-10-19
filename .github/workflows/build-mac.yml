@@ -28,8 +28,8 @@ jobs:
       - name: Build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # DMG only — zip is for electron-updater on tagged releases, not test builds.
-        run: npx electron-builder --mac dmg --publish never
+        # Both arches — macos-latest is arm64 and otherwise only builds host arch.
+        run: npx electron-builder --mac dmg --x64 --arm64 --publish never
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4

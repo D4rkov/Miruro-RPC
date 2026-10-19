@@ -203,7 +203,7 @@ run("git push --tags");
 
 console.log(`
 Done.
-- GitHub Actions → builds MiruroRPC-Setup-${next}.exe + MiruroRPC-${next}-*.dmg/zip and publishes the Release
+- GitHub Actions → builds MiruroRPC-Setup-${next}.exe + MiruroRPC-${next}-*.dmg and publishes the Release
 - Userscript @version is ${next} (Tampermonkey will pick it up from main)
 - Installed tray apps will auto-update from the new Release
 `);

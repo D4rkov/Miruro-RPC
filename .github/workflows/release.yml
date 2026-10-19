@@ -19,7 +19,8 @@ jobs:
             builder_args: --win
           - os: macos-latest
             platform: mac
-            builder_args: --mac
+            # Explicit arches — macos-latest is arm64 and otherwise only builds host arch.
+            builder_args: --mac dmg --x64 --arm64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -45,10 +46,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: |
-            dist/MiruroRPC-Setup-*.exe
-            dist/MiruroRPC-Setup-*.exe.blockmap
-            dist/latest.yml
+          path: dist/MiruroRPC-Setup-*.exe
           if-no-files-found: error
 
       - name: Upload macOS artifacts
@@ -56,11 +54,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos
-          path: |
-            dist/MiruroRPC-*.dmg
-            dist/MiruroRPC-*.zip
-            dist/MiruroRPC-*.zip.blockmap
-            dist/latest-mac.yml
+          path: dist/MiruroRPC-*.dmg
           if-no-files-found: error
 
   release:
@@ -89,11 +83,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             release/MiruroRPC-Setup-*.exe
-            release/MiruroRPC-Setup-*.exe.blockmap
-            release/latest.yml
             release/MiruroRPC-*.dmg
-            release/MiruroRPC-*.zip
-            release/MiruroRPC-*.zip.blockmap
-            release/latest-mac.yml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

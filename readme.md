@@ -71,7 +71,7 @@ Open [Miruro 2.0](https://barelystarted.miruro.tv) (or [miruro.tv](https://www.m
 ```bash
 npm run app        # test locally
 npm run dist       # Windows installer (on Windows)
-npm run dist:mac   # macOS DMG + zip (on macOS)
+npm run dist:mac   # macOS DMGs (on macOS; Intel + Apple Silicon)
 npm run ship       # commit + bump version + push + tag → CI builds Windows + macOS
 ```
 
