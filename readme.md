@@ -1,6 +1,6 @@
 # MiruroRPC
 
-Discord Rich Presence for Miruro — runs in the **system tray** and auto-updates.
+Discord Rich Presence for Miruro — runs in the **system tray** / **menu bar** and auto-updates.
 
 Shows on Discord:
 
@@ -28,21 +28,40 @@ Download the latest release from:
 
 **Windows:** run the installer. MiruroRPC starts in the system tray (near the clock).
 
-**macOS:** open the DMG and drag MiruroRPC to Applications. On first launch, right-click the app → **Open** if Gatekeeper warns about an unidentified developer. The app lives in the menu bar (top right).
+**macOS:**
+
+1. Open the DMG and drag **MiruroRPC** into **Applications**
+2. Clear Gatekeeper’s quarantine flag (unsigned build — macOS otherwise says the app is “damaged”):
+
+```bash
+xattr -cr /Applications/MiruroRPC.app && open /Applications/MiruroRPC.app
+```
+
+3. The app lives in the **menu bar** (top right), not the Dock
 
 It starts at login by default and checks for updates automatically.
 
-### 2. Install the userscript (once)
+### 2. Install Tampermonkey + allow user scripts
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/)
-2. Right-click / click the MiruroRPC tray / menu bar icon → **Install / update userscript**  
+1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser  
+   (Chrome, Edge, Vivaldi, Brave, Firefox — Safari is unreliable)
+2. **Chromium browsers** (Chrome / Edge / Vivaldi / Brave): open the extensions page → **Tampermonkey** → **Details** → enable **Allow User Scripts**  
+   - Chrome/Edge/Brave: `chrome://extensions`  
+   - Vivaldi: `vivaldi://extensions`  
+   Without this, Tampermonkey shows the script as installed but **“hasn’t run yet”** on Miruro.
+
+### 3. Install the userscript (once)
+
+1. Click the MiruroRPC tray / menu bar icon → **Install / update userscript**  
    (or open [`miruro.user.js`](https://github.com/D4rkov/Miruro-RPC/raw/main/miruro.user.js))
-3. Click **Install** in Tampermonkey
+2. Click **Install** in Tampermonkey
+3. Hard-refresh Miruro (`Ctrl+Shift+R` / `Cmd+Shift+R`)
 
+### 4. Watch anime
 
-### 3. Watch anime
+Open [Miruro 2.0](https://barelystarted.miruro.tv) (or [miruro.tv](https://www.miruro.tv) / [miruro.com](https://www.miruro.com)), play an episode, check Discord.
 
-Open [Miruro 2.0](https://barelystarted.miruro.tv) (or [miruro.tv](https://www.miruro.tv)), play an episode, check Discord.
+Tray / menu bar should show **Connected — browsing** or **Watching on Miruro** when the script is talking to the bridge.
 
 ---
 
@@ -62,7 +81,8 @@ Open [Miruro 2.0](https://barelystarted.miruro.tv) (or [miruro.tv](https://www.m
 
 - Windows 10/11 **or** macOS 11+
 - Discord Desktop
-- Tampermonkey (or another userscript manager)
+- Tampermonkey (Chrome / Edge / Vivaldi / Brave / Firefox)
+- Chromium: **Allow User Scripts** enabled for Tampermonkey
 
 ---
 
@@ -79,6 +99,18 @@ npm run ship       # commit + bump version + push + tag → CI builds Windows + 
 
 ## FAQ
 
+### Tampermonkey says the script “hasn’t run yet” on Miruro
+
+Almost always missing **Allow User Scripts** on Chromium (Chrome, Edge, Vivaldi, Brave). Enable it under Tampermonkey → Details, then hard-refresh Miruro. Also confirm the script is enabled in the Tampermonkey popup on that tab.
+
+### macOS says MiruroRPC is “damaged” and should be moved to the Trash
+
+That is Gatekeeper on an **unsigned** download — the app is not actually corrupted. After installing to Applications:
+
+```bash
+xattr -cr /Applications/MiruroRPC.app && open /Applications/MiruroRPC.app
+```
+
 ### Why does the userscript use `@match *://*/*`?
 
 Miruro uses third-party embeds. The script must also run on the embed host to read playback. On non-Miruro pages it does nothing unless it’s an embed that received a Miruro tab id.
@@ -88,10 +120,6 @@ Maintaining a whitelist of every provider isn’t practical — providers change
 ### Does the tray app update the userscript too?
 
 Not by itself — Tampermonkey is separate from the tray auto-updater. After a tray update you’ll get a one-time prompt to open the matching userscript. When the bridge owns its local port, that link is a tokenized localhost URL; if the port is unavailable it falls back to GitHub. On Miruro, an older script also shows an update banner when the bridge version is newer. Tampermonkey’s own `@updateURL` checks still work in the background.
-
-### macOS says the app is from an unidentified developer
-
-Releases are currently unsigned (no Apple Developer ID). Right-click the app → **Open**, or allow it under **System Settings → Privacy & Security**.
 
 ---
 
