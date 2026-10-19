@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Miruro RPC
 // @namespace    https://github.com/D4rkov
-// @version      2.2.0
+// @version      2.2.1
 // @description  Sends Miruro watch metadata + playback to the local MiruroRPC bridge.
 // @author       Darkov
 // @match        *://*/*
@@ -17,7 +17,7 @@
 (() => {
     "use strict";
 
-    const SCRIPT_VERSION = "2.2.0";
+    const SCRIPT_VERSION = "2.2.1";
     const PORT = 3847;
     const BRIDGE_URL = `ws://127.0.0.1:${PORT}`;
     const FALLBACK_SCRIPT_URL =
