@@ -1,6 +1,6 @@
 {
   "name": "mirurorpc",
-  "version": "2.2.1",
+  "version": "2.2.0",
   "description": "Discord Rich Presence for Miruro — system tray bridge + userscript",
   "homepage": "https://github.com/D4rkov/Miruro-RPC#readme",
   "bugs": {
@@ -86,6 +86,13 @@
       "target": [
         {
           "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
           "arch": [
             "x64",
             "arm64"
