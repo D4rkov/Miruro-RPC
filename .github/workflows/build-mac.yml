@@ -28,15 +28,13 @@ jobs:
       - name: Build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder --mac --publish never
+        # DMG only — zip is for electron-updater on tagged releases, not test builds.
+        run: npx electron-builder --mac dmg --publish never
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: mirurorpc-macos
-          path: |
-            dist/MiruroRPC-*.dmg
-            dist/MiruroRPC-*.zip
-            dist/latest-mac.yml
+          path: dist/MiruroRPC-*.dmg
           if-no-files-found: error
           retention-days: 14
