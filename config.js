@@ -1,0 +1,30 @@
+/** Discord application (Developer Portal → your app → Application ID). */
+export const CLIENT_ID = "1521597072434794527";
+
+/**
+ * Unpacked installs are always "development". Set true to preview the
+ * release popup (no live debug / test presence / Discord setup) without packing.
+ * Leave false before shipping.
+ */
+export const FORCE_RELEASE_UI = false;
+
+/** Social Layer default presence scopes + PKCE (enable Public Client in OAuth2 settings). */
+export const SCOPES = "openid sdk.social_layer_presence";
+
+export const API_BASE = "https://discord.com/api/v10";
+
+export const ACTIVITY = {
+  watchName: "Anime on Miruro! ッ",
+  browseName: "Searching for Anime! ッ",
+  browseDetails: "Looking for peak",
+  buttonLabel: "Watch on Miruro! ッ",
+  // Headless sessions need asset snowflake IDs or HTTPS URLs (not IPC name keys).
+  // miruro: from GET /oauth2/applications/{id}/assets
+  assetId: "1521633309145174119",
+  assetUrl: `https://cdn.discordapp.com/app-assets/${CLIENT_ID}/1521633309145174119.png`,
+  // Medium white glyphs + some transparent padding (Discord badge size is fixed).
+  playUrl:
+    "https://images.weserv.nl/?url=gist.githubusercontent.com%2FD4rkov%2F9d98e11b7937162b12892208cc8ba96b%2Fraw%2Ff8c0df780ce94927d8339074d922c809a7091052%2Fplay.svg&output=png&w=512&h=512&t=1793746388",
+  pauseUrl:
+    "https://images.weserv.nl/?url=gist.githubusercontent.com%2FD4rkov%2F9d98e11b7937162b12892208cc8ba96b%2Fraw%2F638131a7adbdfb6079951ea71f313c65ade9b149%2Fpause.svg&output=png&w=512&h=512&t=1793746388"
+};

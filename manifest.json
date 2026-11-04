@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Miruro RPC",
+  "version": "3.0.0",
+  "description": "Discord Rich Presence for Miruro via Social Layer (extension only).",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "miruro-rpc@darkov",
+      "strict_min_version": "121.0"
+    }
+  },
+  "icons": {
+    "16": "icons/icon.png",
+    "48": "icons/icon.png",
+    "128": "icons/icon.png"
+  },
+  "action": {
+    "default_title": "Miruro RPC",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon.png",
+      "48": "icons/icon.png",
+      "128": "icons/icon.png"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"],
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "storage",
+    "identity",
+    "alarms",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://discord.com/*",
+    "https://miruro.cx/*",
+    "https://www.miruro.cx/*",
+    "https://*.miruro.cx/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://miruro.cx/*",
+        "*://www.miruro.cx/*",
+        "*://*.miruro.cx/*"
+      ],
+      "js": ["content/miruro.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["*://*/*"],
+      "js": ["content/embed.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
+}

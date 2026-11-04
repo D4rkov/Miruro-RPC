@@ -1,0 +1,185 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1115;
+  --card: #1a1d24;
+  --text: #f2f3f5;
+  --muted: #9aa3b2;
+  --accent: #5865f2;
+  --accent-hover: #4752c4;
+  --border: #2b303b;
+  --ok: #57f287;
+  --warn: #fee75c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Author `display` rules beat the UA [hidden] stylesheet — force it. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  width: 380px;
+  font: 13px/1.45 "Segoe UI", system-ui, sans-serif;
+  color: var(--text);
+  background: radial-gradient(120% 80% at 0% 0%, #1b2140 0%, var(--bg) 55%);
+  padding: 14px;
+}
+
+header {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+header img {
+  border-radius: 8px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.sub {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.card {
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+button {
+  flex: 1;
+  border: 0;
+  border-radius: 8px;
+  padding: 9px 12px;
+  background: var(--accent);
+  color: white;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--accent-hover);
+}
+
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+button.ghost:hover {
+  background: #222733;
+}
+
+button.small {
+  flex: none;
+  width: 100%;
+  margin-top: 8px;
+  padding: 7px 10px;
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tip {
+  margin: 8px 0 0;
+}
+
+.setup ol {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+code {
+  display: block;
+  word-break: break-all;
+  background: #0c0e13;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 11px;
+  color: #c9d1e0;
+}
+
+#statusText[data-state="ok"] {
+  color: var(--ok);
+}
+
+#statusText[data-state="watch"] {
+  color: var(--accent);
+}
+
+#statusText[data-state="browse"] {
+  color: var(--warn);
+}
+
+#statusText[data-state="paused"],
+#statusText[data-state="muted"] {
+  color: var(--muted);
+}
+
+#togglePresenceBtn[data-on="false"] {
+  background: #3a3f4b;
+}
+
+#togglePresenceBtn[data-on="false"]:hover {
+  background: #4a5160;
+}
+
+#sharingHint {
+  margin: -2px 0 10px;
+}
+
+.debug-log {
+  margin: 6px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  background: #0c0e13;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font: 10px/1.35 ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: #b8c0cc;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.debug-actions {
+  margin: 8px 0 0;
+}
+
+.debug-actions .small {
+  margin-top: 0;
+}

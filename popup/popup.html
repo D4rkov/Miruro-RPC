@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Miruro RPC</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <img src="../icons/icon.png" alt="" width="28" height="28" />
+    <div>
+      <h1>Miruro RPC</h1>
+      <p class="sub">Discord Rich Presence for Miruro</p>
+    </div>
+  </header>
+
+  <section id="status" class="card">
+    <p id="statusText">Loading…</p>
+    <p id="userText" class="muted" hidden></p>
+  </section>
+
+  <section class="actions" id="sharingRow" hidden>
+    <button id="togglePresenceBtn" type="button">Presence on</button>
+  </section>
+  <section class="actions" id="muteRow" hidden>
+    <button id="muteTitleBtn" type="button" class="ghost">Hide this anime</button>
+  </section>
+  <p id="sharingHint" class="muted tip" hidden></p>
+
+  <section class="actions">
+    <button id="loginBtn" type="button">Connect Discord</button>
+    <button id="logoutBtn" type="button" class="ghost" hidden>Disconnect</button>
+  </section>
+  <p id="pushError" class="muted tip" hidden></p>
+
+  <section class="card debug" id="debugPanel" hidden>
+    <h2>Live debug</h2>
+    <p id="debugMeta" class="muted tip">YOU = browse / watch / pause / play / seek · DISCORD = when it posted</p>
+    <pre id="debugLog" class="debug-log">…</pre>
+    <div class="actions debug-actions">
+      <button id="copyDebug" type="button" class="ghost small">Copy logs</button>
+      <button id="clearDebug" type="button" class="ghost small">Clear</button>
+    </div>
+    <div class="actions" id="testRow" style="margin-top: 8px">
+      <button id="testBtn" type="button" class="ghost">Test presence now</button>
+    </div>
+  </section>
+
+  <section class="card setup" id="setupPanel" hidden>
+    <h2>Discord app setup</h2>
+    <ol>
+      <li>Developer Portal → your app → <strong>OAuth2</strong></li>
+      <li>Enable <strong>Public Client</strong></li>
+      <li>Add this redirect URL:</li>
+    </ol>
+    <code id="redirectUri">…</code>
+    <button id="copyRedirect" type="button" class="ghost small">Copy redirect URL</button>
+    <p class="muted tip">Scopes used: <code>openid</code> + <code>sdk.social_layer_presence</code></p>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
