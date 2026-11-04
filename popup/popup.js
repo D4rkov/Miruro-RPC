@@ -178,7 +178,9 @@ async function refresh() {
   }
 
   if (status.authPending) {
-    statusText.textContent = "Waiting for Discord… (re-open this popup after authorizing)";
+    statusText.textContent = status.isAndroid
+      ? "Waiting for Discord… switch to that tab, approve, then come back here"
+      : "Waiting for Discord… (re-open this popup after authorizing)";
     statusText.dataset.state = "";
     userText.hidden = true;
     loginBtn.hidden = true;
@@ -249,12 +251,33 @@ loginBtn.addEventListener("click", async () => {
   loginBtn.disabled = true;
   statusText.textContent = "Opening Discord…";
   try {
-    await chrome.runtime.sendMessage({ type: "login" });
+    const result = await chrome.runtime.sendMessage({ type: "login" });
+    if (!result?.ok) {
+      statusText.textContent = result?.error || result?.lastAuthError || "Login failed";
+      statusText.dataset.state = "";
+      pushError.hidden = false;
+      pushError.textContent = statusText.textContent;
+      loginBtn.disabled = false;
+      await refresh();
+      return;
+    }
+    // Tab OAuth (Android): Discord is behind this page — tell them to switch.
+    // Don't refresh immediately (authPending may still be writing); keep this copy.
+    if (result.authViaTab) {
+      statusText.textContent =
+        "Discord opened in another tab — switch to it, approve, then come back here";
+      loginBtn.hidden = true;
+      loginBtn.disabled = false;
+      startPoll();
+      return;
+    }
+    // Desktop identity window — same as before.
     startPoll();
     await refresh();
   } catch (err) {
     statusText.textContent = String(err.message || err);
     statusText.dataset.state = "";
+    await refresh();
   } finally {
     loginBtn.disabled = false;
   }

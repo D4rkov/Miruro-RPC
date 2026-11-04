@@ -1,4 +1,11 @@
-import { ACTIVITY, API_BASE, CLIENT_ID, FORCE_RELEASE_UI, SCOPES } from "./config.js";
+import {
+  ACTIVITY,
+  API_BASE,
+  CLIENT_ID,
+  FORCE_RELEASE_UI,
+  OAUTH_REDIRECT_URI,
+  SCOPES
+} from "./config.js";
 
 const STORAGE_KEYS = {
   tokens: "tokens",
@@ -23,6 +30,8 @@ let lastPushError = null;
 let authPending = false;
 /** @type {Promise<void> | null} */
 let loginInFlight = null;
+/** In-tab OAuth waiter — resolved by tabs.onUpdated or oauth-callback content script. */
+let oauthWaiter = null;
 
 /** Active Miruro tab driving presence */
 let activeTabId = null;
@@ -278,17 +287,39 @@ function logDiscord(ok, playback, extra = {}) {
   }
 }
 
+const ALARM_TOKEN_REFRESH = "tokenRefresh";
+const ALARM_SESSION_KEEPALIVE = "sessionKeepalive";
+const ALARM_WATCH_FLUSH = "watchPresenceFlush";
+const ALARM_CLEAR_RETRY = "clearPresenceRetry";
+
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.alarms.create("tokenRefresh", { periodInMinutes: 20 });
+  chrome.alarms.create(ALARM_TOKEN_REFRESH, { periodInMinutes: 20 });
   armSessionKeepalive();
 });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === "tokenRefresh") {
+  if (alarm.name === ALARM_TOKEN_REFRESH) {
     await ensureAccessToken();
     return;
   }
-  if (alarm.name === "sessionKeepalive" && pageMode !== "idle") {
+  if (alarm.name === ALARM_CLEAR_RETRY) {
+    await clearPresence({ allowRetry: true });
+    return;
+  }
+  if (alarm.name === ALARM_WATCH_FLUSH) {
+    await hydrate({ force: true });
+    if (pageMode !== "watch" || !presenceData?.title || !isSharingActive())
+      return;
+    // Android kills setTimeouts — alarm is the reliable watch POST.
+    if (!hasValidPlayback(playbackData) ||
+        (MEDIA_SOURCE_RANK[String(playbackData.source || "")] ?? 0) < 2)
+      watchNavAllowTitleOnly = true;
+    watchAwaitingPlayback = false;
+    lastActivityKey = null;
+    await pushPresence();
+    return;
+  }
+  if (alarm.name === ALARM_SESSION_KEEPALIVE && pageMode !== "idle") {
     await ensureAccessToken();
     if (!(await ensureMiruroTabAlive()))
       return;
@@ -315,11 +346,30 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 /** Tighter keepalive while watching — cold sessions make the next seek pay setup cost. */
 function armSessionKeepalive() {
   if (pageMode === "watch")
-    chrome.alarms.create("sessionKeepalive", { periodInMinutes: 2 });
+    chrome.alarms.create(ALARM_SESSION_KEEPALIVE, { periodInMinutes: 2 });
   else if (pageMode === "browse")
-    chrome.alarms.create("sessionKeepalive", { periodInMinutes: 5 });
+    chrome.alarms.create(ALARM_SESSION_KEEPALIVE, { periodInMinutes: 5 });
   else
-    chrome.alarms.clear("sessionKeepalive");
+    chrome.alarms.clear(ALARM_SESSION_KEEPALIVE);
+}
+
+/** Firefox Android kills event-page timers — alarms still wake us. */
+function armWatchFlushAlarm(delayMs = 2500) {
+  try {
+    chrome.alarms.create(ALARM_WATCH_FLUSH, {
+      when: Date.now() + Math.max(500, Number(delayMs) || 2500)
+    });
+  } catch {
+    chrome.alarms.create(ALARM_WATCH_FLUSH, {
+      delayInMinutes: Math.max(0.05, (Number(delayMs) || 2500) / 60_000)
+    });
+  }
+}
+
+function clearWatchFlushAlarm() {
+  try {
+    chrome.alarms.clear(ALARM_WATCH_FLUSH);
+  } catch { /* ignore */ }
 }
 
 function warmAuth() {
@@ -351,14 +401,20 @@ async function handleMessage(message, sender) {
     return { ok: false, error: "ignored non-miruro sender" };
 
   switch (message?.type) {
-    case "getStatus":
+    case "getStatus": {
       await Promise.all([hydrate({ force: true }), ensureDevBuildFlag()]);
+      const android = await isAndroidRuntime();
+      const redirectUri =
+        !android && typeof chrome.identity?.getRedirectURL === "function"
+          ? chrome.identity.getRedirectURL()
+          : OAUTH_REDIRECT_URI;
       return {
         ok: true,
         isDevBuild,
+        isAndroid: android,
         loggedIn: Boolean(tokens?.access_token),
         user,
-        redirectUri: chrome.identity.getRedirectURL(),
+        redirectUri,
         clientId: CLIENT_ID,
         pageMode,
         activeTabId,
@@ -370,6 +426,7 @@ async function handleMessage(message, sender) {
         lastSent: formatPlaybackShort(lastSentPlayback),
         ...(await sharingStatusPayload())
       };
+    }
     case "getDebugLog":
       await ensureDevBuildFlag();
       if (!isDevBuild)
@@ -395,11 +452,44 @@ async function handleMessage(message, sender) {
       debugLog.length = 0;
       rpcLog("debug cleared");
       return { ok: true };
-    case "login":
-      // Popup closes when the Discord window opens — don't require the
-      // message port to stay alive. Popup polls getStatus instead.
-      startLogin();
-      return { ok: true, pending: true };
+    case "oauthCallback": {
+      const url = String(message?.url || "");
+      const senderUrl = String(sender?.tab?.url || sender?.url || "");
+      if (
+        !url.startsWith(OAUTH_REDIRECT_URI) &&
+        !senderUrl.startsWith(OAUTH_REDIRECT_URI)
+      )
+        return { ok: false, error: "ignored oauth callback" };
+      return acceptOAuthRedirect(url || senderUrl);
+    }
+    case "login": {
+      const android = await isAndroidRuntime();
+      const tabAuth =
+        android || typeof chrome.identity?.launchWebAuthFlow !== "function";
+
+      // Android (and any no-identity browser): don't block the UI on the tab
+      // OAuth — user must leave this page to see Discord. Desktop keeps awaiting
+      // launchWebAuthFlow like before.
+      if (tabAuth) {
+        startLogin().catch(() => {});
+        return { ok: true, authPending: true, authViaTab: true };
+      }
+
+      try {
+        await startLogin();
+        return {
+          ok: true,
+          loggedIn: Boolean(tokens?.access_token),
+          lastAuthError
+        };
+      } catch (err) {
+        return {
+          ok: false,
+          error: String(err?.message || err),
+          lastAuthError: lastAuthError || String(err?.message || err)
+        };
+      }
+    }
     case "logout":
       await logout();
       return { ok: true };
@@ -410,6 +500,7 @@ async function handleMessage(message, sender) {
       await pushTestPresence();
       return { ok: true, lastPushError };
     case "setPresenceEnabled": {
+      await hydrate({ force: true });
       presenceEnabled = Boolean(message.enabled);
       return applySharingGate({
         clear: !presenceEnabled,
@@ -444,7 +535,7 @@ async function handleMessage(message, sender) {
     case "clear":
       return onClear(sender.tab?.id);
     case "leave":
-      return onLeave(sender.tab?.id);
+      return onLeave(sender.tab?.id, message.reason);
     default:
       return { ok: false, error: "unknown message" };
   }
@@ -532,8 +623,21 @@ async function applySharingGate({ clear = false, resume = false } = {}) {
 }
 
 async function hydrate({ force = false } = {}) {
-  if (!force && tokens && user)
+  // Always re-read sessionToken — Android wakeups often have auth in memory
+  // but a newer token only in storage (or the reverse).
+  if (!force && tokens && user) {
+    const bit = await chrome.storage.local.get([
+      STORAGE_KEYS.sessionToken,
+      STORAGE_KEYS.presenceEnabled,
+      STORAGE_KEYS.mutedTitles
+    ]);
+    sessionToken = bit[STORAGE_KEYS.sessionToken] || null;
+    if (bit[STORAGE_KEYS.presenceEnabled] !== undefined)
+      presenceEnabled = bit[STORAGE_KEYS.presenceEnabled] !== false;
+    if (Array.isArray(bit[STORAGE_KEYS.mutedTitles]))
+      mutedTitles = bit[STORAGE_KEYS.mutedTitles].map(normalizeTitleKey).filter(Boolean);
     return;
+  }
   const stored = await chrome.storage.local.get([
     STORAGE_KEYS.tokens,
     STORAGE_KEYS.user,
@@ -583,8 +687,6 @@ function startLogin() {
     }
   })();
 
-  // Swallow here — popup reads lastAuthError via getStatus
-  loginInFlight.catch(() => {});
   return loginInFlight;
 }
 
@@ -616,8 +718,223 @@ async function sha256Base64Url(text) {
   return base64Url(new Uint8Array(digest));
 }
 
+async function isAndroidRuntime() {
+  try {
+    const info = await chrome.runtime.getPlatformInfo();
+    return info?.os === "android";
+  } catch {
+    return /android/i.test(navigator.userAgent || "");
+  }
+}
+
+function isOAuthCallbackUrl(url) {
+  return Boolean(url) && String(url).startsWith(OAUTH_REDIRECT_URI);
+}
+
+/**
+ * Resolve in-flight tab login, or finish OAuth from storage if the background
+ * was killed after Connect (common on Firefox Android).
+ */
+async function acceptOAuthRedirect(url) {
+  const responseUrl = String(url || "");
+  if (!isOAuthCallbackUrl(responseUrl))
+    return { ok: false, error: "not oauth callback" };
+
+  if (oauthWaiter) {
+    oauthWaiter.resolve(responseUrl);
+    return { ok: true, via: "waiter" };
+  }
+
+  // login() is mid-flight but waiter not armed yet — ignore duplicate ping.
+  if (loginInFlight && tokens?.access_token)
+    return { ok: true, via: "done" };
+
+  const pending = (await chrome.storage.local.get(STORAGE_KEYS.oauthPending))[
+    STORAGE_KEYS.oauthPending
+  ];
+  if (!pending?.codeVerifier) {
+    if (tokens?.access_token)
+      return { ok: true, via: "done" };
+    return { ok: false, error: "no pending login" };
+  }
+
+  try {
+    authPending = true;
+    await completeOAuthFromResponseUrl(responseUrl);
+    lastAuthError = null;
+    authPending = false;
+    loginInFlight = null;
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.authPending]: false,
+      [STORAGE_KEYS.lastAuthError]: null
+    });
+    return { ok: true, via: "direct" };
+  } catch (err) {
+    lastAuthError = String(err?.message || err);
+    authPending = false;
+    loginInFlight = null;
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.authPending]: false,
+      [STORAGE_KEYS.lastAuthError]: lastAuthError
+    });
+    console.error("Discord oauth callback failed:", err);
+    return { ok: false, error: lastAuthError };
+  }
+}
+
+/** Catch OAuth redirect in a normal tab (Firefox Android has no identity helper). */
+function waitForOAuthRedirect(redirectUri, timeoutMs = 180000) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Login timed out — finish Discord authorize, or try again."));
+    }, timeoutMs);
+
+    const poll = setInterval(() => {
+      chrome.tabs.query({}).then((tabs) => {
+        for (const tab of tabs) {
+          if (tab?.url && String(tab.url).startsWith(redirectUri))
+            maybeFinish(tab.url);
+        }
+      }).catch(() => {});
+    }, 1000);
+
+    function cleanup() {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(poll);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      if (oauthWaiter?.reject === reject)
+        oauthWaiter = null;
+    }
+
+    function maybeFinish(url) {
+      if (settled)
+        return;
+      if (!url || !String(url).startsWith(redirectUri))
+        return;
+      cleanup();
+      resolve(String(url));
+    }
+
+    function onUpdated(_tabId, changeInfo, tab) {
+      maybeFinish(changeInfo.url || tab?.url);
+    }
+
+    oauthWaiter = {
+      redirectUri,
+      resolve: (url) => maybeFinish(url),
+      reject
+    };
+
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+}
+
+async function launchOAuthAuthorize(authUrl, redirectUri, { preferTab = false } = {}) {
+  const canIdentity = typeof chrome.identity?.launchWebAuthFlow === "function";
+
+  // Desktop identity window (unless caller forced tab flow).
+  if (!preferTab && canIdentity) {
+    try {
+      const responseUrl = await chrome.identity.launchWebAuthFlow({
+        url: authUrl,
+        interactive: true
+      });
+      if (responseUrl)
+        return responseUrl;
+      throw new Error("Discord auth closed before completing.");
+    } catch (err) {
+      throw new Error(
+        err?.message ||
+          "Auth window closed or blocked. Try again and leave the Discord window open until it finishes."
+      );
+    }
+  }
+
+  // Tab flow — used on Firefox Android (no identity API).
+  const tab = await chrome.tabs.create({ url: authUrl, active: true });
+  try {
+    const responseUrl = await waitForOAuthRedirect(redirectUri);
+    try {
+      if (tab?.id != null)
+        await chrome.tabs.remove(tab.id);
+    } catch { /* already closed */ }
+    return responseUrl;
+  } catch (err) {
+    try {
+      if (tab?.id != null)
+        await chrome.tabs.remove(tab.id);
+    } catch { /* ignore */ }
+    throw err;
+  }
+}
+
+async function completeOAuthFromResponseUrl(responseUrl) {
+  if (tokens?.access_token)
+    return;
+  if (!responseUrl)
+    throw new Error("Discord returned an empty redirect");
+
+  const redirected = new URL(responseUrl);
+  const error = redirected.searchParams.get("error");
+  if (error)
+    throw new Error(redirected.searchParams.get("error_description") || error);
+
+  const code = redirected.searchParams.get("code");
+  const returnedState = redirected.searchParams.get("state");
+  const pending = (await chrome.storage.local.get(STORAGE_KEYS.oauthPending))[
+    STORAGE_KEYS.oauthPending
+  ];
+
+  if (!code)
+    throw new Error("No authorization code returned from Discord");
+  if (!pending?.codeVerifier) {
+    if (tokens?.access_token)
+      return;
+    throw new Error("Missing PKCE verifier — try Connect again");
+  }
+  if (returnedState !== pending.oauthState)
+    throw new Error("OAuth state mismatch — try Connect again");
+
+  // Prevent double exchange if callback + tabs listener both fire.
+  await chrome.storage.local.remove(STORAGE_KEYS.oauthPending);
+
+  try {
+    const tokenJson = await exchangeCode(
+      code,
+      pending.codeVerifier,
+      pending.redirectUri || OAUTH_REDIRECT_URI
+    );
+    tokens = normalizeTokens(tokenJson);
+    user = await fetchUser(tokens.access_token);
+    sessionToken = null;
+    await persistAuth();
+    setBadge("on");
+  } catch (err) {
+    // Restore pending so a retry / second path can still finish if exchange failed.
+    await chrome.storage.local.set({ [STORAGE_KEYS.oauthPending]: pending });
+    throw err;
+  }
+}
+
 async function login() {
-  const redirectUri = chrome.identity.getRedirectURL();
+  const android = await isAndroidRuntime();
+  const canIdentityRedirect = typeof chrome.identity?.getRedirectURL === "function";
+
+  // Desktop: chromiumapp / extensions.allizom redirect via identity.
+  // Android: hosted HTTPS callback (identity API does not exist).
+  const redirectUri =
+    !android && canIdentityRedirect
+      ? chrome.identity.getRedirectURL()
+      : OAUTH_REDIRECT_URI;
+
+  if (!redirectUri)
+    throw new Error("OAuth redirect URI is not configured.");
+
   const codeVerifier = randomString(32);
   const codeChallenge = await sha256Base64Url(codeVerifier);
   const state = randomString(16);
@@ -639,9 +956,8 @@ async function login() {
 
   let responseUrl;
   try {
-    responseUrl = await chrome.identity.launchWebAuthFlow({
-      url: url.toString(),
-      interactive: true
+    responseUrl = await launchOAuthAuthorize(url.toString(), redirectUri, {
+      preferTab: android || !canIdentityRedirect
     });
   } catch (err) {
     throw new Error(
@@ -650,38 +966,7 @@ async function login() {
     );
   }
 
-  if (!responseUrl)
-    throw new Error("Discord returned an empty redirect");
-
-  const redirected = new URL(responseUrl);
-  const error = redirected.searchParams.get("error");
-  if (error)
-    throw new Error(redirected.searchParams.get("error_description") || error);
-
-  const code = redirected.searchParams.get("code");
-  const returnedState = redirected.searchParams.get("state");
-  const pending = (await chrome.storage.local.get(STORAGE_KEYS.oauthPending))[
-    STORAGE_KEYS.oauthPending
-  ];
-
-  if (!code)
-    throw new Error("No authorization code returned from Discord");
-  if (!pending?.codeVerifier)
-    throw new Error("Missing PKCE verifier — try Connect again");
-  if (returnedState !== pending.oauthState)
-    throw new Error("OAuth state mismatch — try Connect again");
-
-  const tokenJson = await exchangeCode(
-    code,
-    pending.codeVerifier,
-    pending.redirectUri || redirectUri
-  );
-  tokens = normalizeTokens(tokenJson);
-  user = await fetchUser(tokens.access_token);
-  sessionToken = null;
-  await persistAuth();
-  await chrome.storage.local.remove(STORAGE_KEYS.oauthPending);
-  setBadge("on");
+  await completeOAuthFromResponseUrl(responseUrl);
 }
 
 async function exchangeCode(code, codeVerifier, redirectUri) {
@@ -804,11 +1089,20 @@ function onClaim(tabId, mode) {
 function presenceMetaKey(data) {
   if (!data)
     return "";
-  // Title + episode only. Cover/url load a moment later and were wrongly
-  // treated as "switch episode", re-POSTing with the previous show's time.
+  // Title + episode only. Cover/ep-title load later and must not look like a
+  // show switch (that wiped playback and froze Discord at 00:00).
   return JSON.stringify({
     title: String(data.title || "").trim().toLowerCase(),
     episode: Number(data.episode) || 0
+  });
+}
+
+function presenceEnrichKey(data) {
+  if (!data)
+    return "";
+  return JSON.stringify({
+    episodeTitle: String(data.episodeTitle || "").trim().toLowerCase(),
+    cover: String(data.cover || "").trim()
   });
 }
 
@@ -835,6 +1129,7 @@ function onPresence(tabId, data) {
   activeTabId = tabId;
   const tabChanged = prevTab != null && prevTab !== tabId;
   const metaChanged = presenceMetaKey(data) !== presenceMetaKey(presenceData);
+  const enrichChanged = presenceEnrichKey(data) !== presenceEnrichKey(presenceData);
   const becameWatch = pageMode !== "watch";
   pageMode = "watch";
   presenceData = data || null;
@@ -863,6 +1158,12 @@ function onPresence(tabId, data) {
       lastMediaSourceAt = Date.now();
     }
     scheduleWatchPlaybackKick(Math.max(0, playbackMuteUntil - Date.now()) + 60);
+  } else if (enrichChanged) {
+    // Cover / episode title arrived after the first Android title-only POST.
+    lastActivityKey = null;
+    flushPresence({ urgent: true });
+    persistPresenceState();
+    return { ok: true };
   }
 
   armSessionKeepalive();
@@ -893,9 +1194,23 @@ function onPresence(tabId, data) {
     lastActivityKey = null;
     // Even if YOU nav coalesced, still arm media flush — returning to an
     // already-playing tab must not stall until a manual pause/seek.
-    scheduleWatchPlaybackKick(Math.max(0, playbackMuteUntil - Date.now()) + 60);
-    scheduleWatchNavFallback(Math.max(0, playbackMuteUntil - Date.now()) + 1800);
+    const kickIn = Math.max(0, playbackMuteUntil - Date.now()) + 60;
+    const fallbackIn = Math.max(0, playbackMuteUntil - Date.now()) + 1800;
+    scheduleWatchPlaybackKick(kickIn);
+    scheduleWatchNavFallback(fallbackIn);
+    // Survive Firefox Android background kills (setTimeout is lost).
+    armWatchFlushAlarm(fallbackIn);
   }, navDelay);
+
+  // Phone: don't wait on iframes/timers — post title ASAP so Discord leaves browse.
+  isAndroidRuntime().then((android) => {
+    if (!android || pageMode !== "watch" || !presenceData?.title)
+      return;
+    watchNavAllowTitleOnly = true;
+    lastActivityKey = null;
+    armWatchFlushAlarm(800);
+    flushPresence({ urgent: true });
+  }).catch(() => {});
 
   persistPresenceState();
   return { ok: true };
@@ -914,6 +1229,7 @@ function clearWatchPlaybackTimers() {
     clearTimeout(watchNavFallbackTimer);
     watchNavFallbackTimer = null;
   }
+  clearWatchFlushAlarm();
 }
 
 /** After mute, force one progress POST with title + time (no 00:00 intermediate). */
@@ -1312,7 +1628,7 @@ async function onActiveTabGone(tabId) {
   await clearPresenceState();
 }
 
-async function clearPresenceState() {
+async function clearPresenceState({ keepalive = false } = {}) {
   const wasActive = pageMode !== "idle";
   if (wasActive)
     logYouNav("leave Miruro");
@@ -1329,7 +1645,10 @@ async function clearPresenceState() {
   dotFrame = 0;
   armSessionKeepalive();
   persistPresenceState();
-  await clearPresence();
+  if (keepalive)
+    await clearPresenceKeepalive();
+  else
+    await clearPresence();
   if (wasActive)
     logDiscord(true, null, { shown: "cleared", ms: 0 });
 }
@@ -1342,7 +1661,15 @@ async function onClear(tabId) {
   return { ok: true };
 }
 
-async function onLeave(tabId) {
+async function onLeave(tabId, reason = "") {
+  if (tabId != null && activeTabId != null && tabId !== activeTabId)
+    return { ok: true };
+  // Android minimize / app switch — clear Discord with keepalive so the
+  // request can finish after Firefox backgrounds the page.
+  if (reason === "hidden" || reason === "pagehide" || reason === "freeze") {
+    await clearPresenceState({ keepalive: true });
+    return { ok: true };
+  }
   if (tabId == null || activeTabId == null || tabId === activeTabId)
     await onActiveTabGone(tabId ?? activeTabId);
   return { ok: true };
@@ -1449,6 +1776,13 @@ async function pushPresence({ keepalive = false } = {}) {
   pushQueued = false;
 
   try {
+    // Always refresh session token from disk before POST (Android wakeups).
+    try {
+      const bit = await chrome.storage.local.get(STORAGE_KEYS.sessionToken);
+      if (bit[STORAGE_KEYS.sessionToken])
+        sessionToken = bit[STORAGE_KEYS.sessionToken];
+    } catch { /* ignore */ }
+
     // Single POST per entry — if state moves, queue ONE follow-up (no burst).
     let accessToken = null;
     if (tokens?.access_token && Date.now() < (tokens.expires_at || 0))
@@ -1462,6 +1796,7 @@ async function pushPresence({ keepalive = false } = {}) {
       return;
     }
 
+    const android = await isAndroidRuntime();
     const snapMode = pageMode;
     const snapPresence = presenceData;
     // Use the YOU-action snapshot so a delayed POST can't turn "pause" into
@@ -1477,8 +1812,13 @@ async function pushPresence({ keepalive = false } = {}) {
         Date.now() >= playbackMuteUntil
       ) {
         snapPlayback = playbackSnapshot(playbackData);
-      } else if (watchNavAllowTitleOnly) {
-        snapPlayback = null;
+      } else if (watchNavAllowTitleOnly || android) {
+        // Phone: don't stall forever, but keep any media we already have so
+        // Discord gets a real progress bar (not frozen 00:00).
+        if (hasValidPlayback(playbackData))
+          snapPlayback = playbackSnapshot(playbackData);
+        else
+          snapPlayback = seedPlaybackFromPresence(snapPresence);
       } else if (watchAwaitingPlayback) {
         // Accidental flush during switch — wait for kick/fallback.
         return;
@@ -1488,13 +1828,13 @@ async function pushPresence({ keepalive = false } = {}) {
     } else if (pendingUserAction?.snapshot) {
       snapPlayback = pendingUserAction.snapshot;
     } else {
-      snapPlayback = playbackSnapshot(playbackData);
+      snapPlayback = playbackSnapshot(playbackData) || seedPlaybackFromPresence(snapPresence);
     }
 
     watchNavAllowTitleOnly = false;
 
     if (snapMode === "idle") {
-      await clearPresence();
+      await clearPresence({ keepalive: android });
       logDiscord(true, null, { shown: "cleared", ms: 0 });
       return;
     }
@@ -1509,7 +1849,7 @@ async function pushPresence({ keepalive = false } = {}) {
         state: "One more episode...",
         application_id: CLIENT_ID,
         platform: "desktop",
-        supported_platforms: ["desktop"],
+        supported_platforms: ["desktop", "android", "ios"],
         assets: {
           large_image: ACTIVITY.assetUrl || ACTIVITY.assetId,
           large_text: ACTIVITY.browseName
@@ -1517,6 +1857,7 @@ async function pushPresence({ keepalive = false } = {}) {
         timestamps: { start: String(browseStart) }
       };
     } else {
+      // Full payload first (ep title, cover, progress). Minimal is 400-fallback only.
       activity = buildWatchActivity(snapPresence, snapPlayback);
       if (!activity)
         return;
@@ -1531,10 +1872,27 @@ async function pushPresence({ keepalive = false } = {}) {
     const actionAtStart = pendingUserAction?.action || null;
 
     try {
-      const result = await upsertHeadlessSession(accessToken, activity, sessionToken);
+      let result;
+      try {
+        result = await upsertHeadlessSession(accessToken, activity, sessionToken);
+      } catch (err) {
+        // Watch payloads with cover/buttons sometimes 400 — retry minimal, same token.
+        if (snapMode === "watch" && sessionToken) {
+          const minimal = buildMinimalWatchActivity(snapPresence, snapPlayback);
+          if (!minimal)
+            throw err;
+          activity = minimal;
+          result = await upsertHeadlessSession(accessToken, activity, sessionToken);
+        } else {
+          throw err;
+        }
+      }
       if (result?.token)
         sessionToken = result.token;
-      chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: sessionToken }).catch(() => {});
+      // Await persist — Android may kill us before a fire-and-forget write lands.
+      await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: sessionToken });
+      if (snapMode === "watch")
+        clearWatchFlushAlarm();
 
       lastActivityKey = key;
       lastPushAt = Date.now();
@@ -1660,7 +2018,7 @@ function buildWatchActivity(presence, playback) {
     state,
     application_id: CLIENT_ID,
     platform: "desktop",
-    supported_platforms: ["desktop"],
+    supported_platforms: ["desktop", "android", "ios"],
     assets: {
       large_image: largeImage,
       large_text: details.slice(0, 128),
@@ -1711,7 +2069,7 @@ function hasValidPlayback(playback) {
 }
 
 const COVER_HOST_ALLOW =
-  /(^|\.)(miruro\.cx|anilist\.co|anilistcdn\.com|myanimelist\.net|cdn\.myanimelist\.net|kitsu\.io|media\.kitsu\.io|discordapp\.com|discordapp\.net|discord\.com|imgur\.com|i\.imgur\.com|image\.tmdb\.org|themoviedb\.org|wp\.com|cloudfront\.net|bunnycdn\.com|b-cdn\.net)$/i;
+  /(^|\.)(miruro\.cx|anilist\.co|anilistcdn\.com|myanimelist\.net|cdn\.myanimelist\.net|kitsu\.io|media\.kitsu\.io|discordapp\.com|discordapp\.net|discord\.com|imgur\.com|i\.imgur\.com|image\.tmdb\.org|themoviedb\.org|wp\.com|wordpress\.com|cloudfront\.net|bunnycdn\.com|b-cdn\.net|googleusercontent\.com|ggpht\.com)$/i;
 
 function sanitizePresenceText(value, max = 128) {
   return String(value || "")
@@ -1786,9 +2144,14 @@ async function upsertHeadlessSession(accessToken, activity, token) {
       rateLimitUntil = Date.now() + Math.max(10, retry) * 1000;
       throw new Error("You are being rate limited.");
     }
-    // Token may be stale — drop and retry once without it
-    if (token && (res.status === 400 || res.status === 404)) {
+    // 404 only: token is dead — safe to open a replacement session.
+    // 400 is often a bad activity payload; retrying without the token orphans
+    // the live browse session (stuck "Looking for peak").
+    if (token && res.status === 404) {
       sessionToken = null;
+      try {
+        await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: null });
+      } catch { /* ignore */ }
       return upsertHeadlessSession(accessToken, activity, null);
     }
     throw new Error(msg);
@@ -1797,8 +2160,50 @@ async function upsertHeadlessSession(accessToken, activity, token) {
   return json;
 }
 
+/** Strip optional fields Discord sometimes rejects on mobile. */
+function buildMinimalWatchActivity(presence, playback = null) {
+  const details = sanitizePresenceText(presence?.title, 128);
+  if (!details)
+    return null;
+  const episode = presence?.episode || 1;
+  let state = `EP. ${episode}`;
+  if (presence?.episodeTitle) {
+    const prefix = `${state}: "`;
+    const suffix = `"`;
+    const max = 128 - prefix.length - suffix.length;
+    const epTitle = sanitizePresenceText(presence.episodeTitle, Math.max(0, max));
+    if (epTitle)
+      state = `${prefix}${epTitle}${suffix}`;
+  }
+  const cover = sanitizeCover(presence?.cover);
+  const media = hasValidPlayback(playback) ? playback : seedPlaybackFromPresence(presence);
+  const now = Date.now();
+  let timestamps = { start: String(now), end: String(now) };
+  if (hasValidPlayback(media) && !media.paused) {
+    const currentTime = Math.max(0, Math.min(Number(media.currentTime) || 0, media.duration));
+    timestamps = {
+      start: String(Math.floor(now - currentTime * 1000)),
+      end: String(Math.floor(now + (media.duration - currentTime) * 1000))
+    };
+  }
+  return {
+    type: 3,
+    name: ACTIVITY.watchName,
+    details,
+    state,
+    application_id: CLIENT_ID,
+    platform: "desktop",
+    supported_platforms: ["desktop", "android", "ios"],
+    assets: {
+      large_image: cover || ACTIVITY.assetUrl || ACTIVITY.assetId,
+      large_text: details.slice(0, 128)
+    },
+    timestamps
+  };
+}
+
 async function deleteHeadlessSession(accessToken, token, { keepalive = false } = {}) {
-  await fetch(`${API_BASE}/users/@me/headless-sessions/delete`, {
+  const res = await fetch(`${API_BASE}/users/@me/headless-sessions/delete`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -1807,14 +2212,38 @@ async function deleteHeadlessSession(accessToken, token, { keepalive = false } =
     body: JSON.stringify({ token }),
     keepalive
   });
+  // 204 success; 404 already gone — both fine. Anything else must retry.
+  if (res.ok || res.status === 404)
+    return true;
+  const json = await res.json().catch(() => ({}));
+  throw new Error(json.message || json.error || `Clear presence failed (${res.status})`);
 }
 
 /** Best-effort clear during browser quit — keepalive so the request can outlive the SW. */
 async function clearPresenceKeepalive() {
-  const accessToken = tokens?.access_token || null;
-  const token = sessionToken;
+  let accessToken = tokens?.access_token || null;
+  let token = sessionToken;
+  try {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.sessionToken,
+      STORAGE_KEYS.tokens
+    ]);
+    token = token || stored[STORAGE_KEYS.sessionToken] || null;
+    if (!accessToken)
+      accessToken = stored[STORAGE_KEYS.tokens]?.access_token || null;
+  } catch { /* ignore */ }
   if (!accessToken || !token)
     return;
+
+  // Delete on Discord FIRST. Wiping the token before the request finishes is
+  // how Android force-stop left "Looking for peak" stuck with no way to clear.
+  try {
+    await deleteHeadlessSession(accessToken, token, { keepalive: true });
+  } catch (err) {
+    console.warn("clearPresenceKeepalive:", err);
+    return;
+  }
+
   sessionToken = null;
   lastActivityKey = null;
   pageMode = "idle";
@@ -1827,25 +2256,54 @@ async function clearPresenceKeepalive() {
       [STORAGE_KEYS.presenceState]: null
     });
   } catch { /* ignore */ }
-  try {
-    await deleteHeadlessSession(accessToken, token, { keepalive: true });
-  } catch (err) {
-    console.warn("clearPresenceKeepalive:", err);
-  }
 }
 
-async function clearPresence() {
+async function clearPresence({ allowRetry = true, keepalive = false } = {}) {
+  await hydrate();
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.sessionToken);
+  const token = sessionToken || stored[STORAGE_KEYS.sessionToken] || null;
+  if (token)
+    sessionToken = token;
+
   const accessToken = await ensureAccessToken();
-  if (accessToken && sessionToken) {
+  if (accessToken && token) {
     try {
-      await deleteHeadlessSession(accessToken, sessionToken);
+      await deleteHeadlessSession(accessToken, token, { keepalive });
     } catch (err) {
       console.warn("clearPresence:", err);
+      // Keep the token — discarding it leaves Discord stuck on the old activity.
+      sessionToken = token;
+      await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: token });
+      setPushError(String(err?.message || err));
+      if (allowRetry) {
+        try {
+          chrome.alarms.create(ALARM_CLEAR_RETRY, { when: Date.now() + 5000 });
+        } catch {
+          chrome.alarms.create(ALARM_CLEAR_RETRY, { delayInMinutes: 0.1 });
+        }
+      }
+      return false;
     }
+  } else if (token && !accessToken) {
+    // Can't talk to Discord yet — don't throw away the only delete key.
+    setPushError("Couldn't clear Discord presence (not authorized)");
+    if (allowRetry) {
+      try {
+        chrome.alarms.create(ALARM_CLEAR_RETRY, { when: Date.now() + 8000 });
+      } catch {
+        chrome.alarms.create(ALARM_CLEAR_RETRY, { delayInMinutes: 0.15 });
+      }
+    }
+    return false;
   }
+
   sessionToken = null;
   lastActivityKey = null;
+  try {
+    chrome.alarms.clear(ALARM_CLEAR_RETRY);
+  } catch { /* ignore */ }
   await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: null });
+  setPushError(null);
   if (!tokens?.access_token)
     setBadge("off");
   else if (!presenceEnabled)
@@ -1854,6 +2312,7 @@ async function clearPresence() {
     setBadge("muted");
   else
     setBadge("on");
+  return true;
 }
 
 async function clearStaleSessionIfNoMiruro() {
@@ -1908,4 +2367,22 @@ hydrate().then(async () => {
   warmAuth();
   // Browser kill / crash often skips leave — drop leftover headless RPC on boot.
   await clearStaleSessionIfNoMiruro();
+
+  // Android: background often dies during Discord authorize — finish if callback tab is open.
+  try {
+    const pending = (await chrome.storage.local.get(STORAGE_KEYS.oauthPending))[
+      STORAGE_KEYS.oauthPending
+    ];
+    if (pending?.codeVerifier && !tokens?.access_token) {
+      const tabs = await chrome.tabs.query({});
+      for (const tab of tabs) {
+        if (isOAuthCallbackUrl(tab?.url)) {
+          await acceptOAuthRedirect(tab.url);
+          break;
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
 }).catch(() => {});

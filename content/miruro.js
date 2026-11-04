@@ -463,15 +463,32 @@
     setTimeout(pulsePlayback, 700);
   }
 
+  function isAndroidUa() {
+    return /android/i.test(navigator.userAgent || "");
+  }
+
   function onVisibility() {
     if (document.visibilityState === "hidden") {
       lastHiddenAt = Date.now();
+      // Desktop: keep RPC while flipping tabs. Phone: minimize / app-switch
+      // must clear — beforeunload often never runs on Android.
+      if (isAndroidUa()) {
+        stopBrowseTicker();
+        chrome.runtime.sendMessage({ type: "leave", reason: "hidden" }).catch(() => {});
+      }
       return;
     }
     // Short tab flicker — don't thrash presence
     if (Date.now() - lastHiddenAt < 250)
       return;
     claim();
+  }
+
+  function onPageHide() {
+    if (!isAndroidUa())
+      return;
+    stopBrowseTicker();
+    chrome.runtime.sendMessage({ type: "leave", reason: "pagehide" }).catch(() => {});
   }
 
   let boundVideo = null;
@@ -791,9 +808,14 @@
   navObserver.observe(document.documentElement, { childList: true, subtree: true });
 
   document.addEventListener("visibilitychange", onVisibility);
+  window.addEventListener("pagehide", onPageHide);
+  document.addEventListener("freeze", onPageHide);
   window.addEventListener("beforeunload", () => {
     stopBrowseTicker();
-    chrome.runtime.sendMessage({ type: "leave" }).catch(() => {});
+    chrome.runtime.sendMessage({
+      type: "leave",
+      reason: isAndroidUa() ? "pagehide" : ""
+    }).catch(() => {});
   });
 
   presenceTimer = setInterval(() => {

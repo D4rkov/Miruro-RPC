@@ -13,6 +13,14 @@ export const SCOPES = "openid sdk.social_layer_presence";
 
 export const API_BASE = "https://discord.com/api/v10";
 
+/**
+ * HTTPS redirect for Firefox Android (no identity API).
+ * Must also be listed in Discord Developer Portal → OAuth2 → Redirects.
+ * Hosted from the public miruro-rpc-oauth GitHub Pages site.
+ */
+export const OAUTH_REDIRECT_URI =
+  "https://d4rkov.github.io/miruro-rpc-oauth/callback.html";
+
 export const ACTIVITY = {
   watchName: "Anime on Miruro! ッ",
   browseName: "Searching for Anime! ッ",

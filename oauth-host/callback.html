@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Miruro RPC — Login</title>
+  <style>
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font: 16px/1.45 system-ui, sans-serif;
+      background: #0f1115;
+      color: #f2f3f5;
+      padding: 24px;
+      text-align: center;
+    }
+    p { color: #9aa3b2; max-width: 28rem; }
+  </style>
+</head>
+<body>
+  <div>
+    <h1>Miruro RPC</h1>
+    <p id="msg">Finishing Discord login… stay on this page a moment, then open Miruro RPC again.</p>
+  </div>
+  <script>
+    (function () {
+      const params = new URLSearchParams(location.search);
+      const msg = document.getElementById("msg");
+      if (params.get("error")) {
+        msg.textContent = params.get("error_description") || params.get("error") || "Login failed.";
+        return;
+      }
+      if (params.get("code")) {
+        msg.textContent =
+          "Authorized. Open Miruro RPC from the Firefox menu — you should be signed in. You can close this tab.";
+        return;
+      }
+      msg.textContent = "Missing login code. Close this tab and try Connect Discord again.";
+    })();
+  </script>
+</body>
+</html>
