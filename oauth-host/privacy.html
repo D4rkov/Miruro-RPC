@@ -43,7 +43,7 @@
 <body>
   <main>
     <h1>Miruro RPC Privacy Policy</h1>
-    <p class="meta">Last updated: November 4, 2026</p>
+    <p class="meta">Last updated: November 4, 2026 (OAuth token wording clarified)</p>
 
     <p>
       Miruro RPC (“the extension”) is a browser add-on that shows your
@@ -62,9 +62,14 @@
     <h2>Data the extension uses</h2>
     <p><strong>Discord account (authentication)</strong></p>
     <ul>
-      <li>When you tap Connect Discord, you sign in with Discord OAuth (PKCE).</li>
-      <li>Access and refresh tokens, and basic profile fields needed to show you are signed in, are stored in the browser’s extension storage.</li>
-      <li>Tokens are used only to talk to Discord’s API (login refresh and presence).</li>
+      <li>When you tap Connect Discord, you sign in with Discord’s normal OAuth login (PKCE / public client). You never enter your Discord password into the extension itself.</li>
+      <li>
+        The extension stores Discord <strong>OAuth access and refresh tokens</strong> for this app only
+        (scopes: <code>openid</code> and <code>sdk.social_layer_presence</code>),
+        plus basic profile fields used to show that you are signed in (for example username / display name).
+        These are <strong>not</strong> your Discord password and <strong>not</strong> a full Discord user “account token.”
+      </li>
+      <li>Those OAuth tokens are stored in the browser’s extension storage on your device and are used only to call Discord’s API: refresh the login and create/update/clear Rich Presence (headless sessions).</li>
     </ul>
 
     <p><strong>Miruro activity (website content / activity)</strong></p>
@@ -90,10 +95,11 @@
 
     <h2>Data stored on your device</h2>
     <ul>
-      <li>Discord tokens and signed-in user display info</li>
+      <li>Discord <strong>OAuth access token</strong> and <strong>OAuth refresh token</strong> for this extension (not your password; not a user account token)</li>
+      <li>Signed-in Discord display info (e.g. username / global name) for the popup UI</li>
       <li>Presence preferences (enabled/disabled, muted anime titles)</li>
-      <li>Temporary OAuth/PKCE state during login</li>
-      <li>Session identifiers needed to update or clear Discord presence</li>
+      <li>Temporary OAuth/PKCE values during login (<code>code_verifier</code>, <code>state</code>, redirect URI)</li>
+      <li>Discord <strong>headless presence session token</strong> (used only to update or delete the Rich Presence session)</li>
     </ul>
     <p>
       Disconnecting Discord in the extension removes stored auth data from extension storage (as far as the browser allows). Uninstalling the extension removes its local storage.
