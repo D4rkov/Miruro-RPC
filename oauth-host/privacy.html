@@ -65,11 +65,18 @@
       <li>When you tap Connect Discord, you sign in with Discord’s normal OAuth login (PKCE / public client). You never enter your Discord password into the extension itself.</li>
       <li>
         The extension stores Discord <strong>OAuth access and refresh tokens</strong> for this app only
-        (scopes: <code>openid</code> and <code>sdk.social_layer_presence</code>),
+        (scopes requested: <code>openid</code> and <code>sdk.social_layer_presence</code>),
         plus basic profile fields used to show that you are signed in (for example username / display name).
         These are <strong>not</strong> your Discord password and <strong>not</strong> a full Discord user “account token.”
       </li>
       <li>Those OAuth tokens are stored in the browser’s extension storage on your device and are used only to call Discord’s API: refresh the login and create/update/clear Rich Presence (headless sessions).</li>
+      <li>
+        <strong>Why Discord’s authorize screen may mention “relationships”:</strong>
+        <code>sdk.social_layer_presence</code> is Discord’s Social SDK “default presence” umbrella scope.
+        Discord bundles Rich Presence with related Social SDK capabilities (their docs list Friend System &amp; Relationships alongside Presence).
+        Miruro RPC <strong>does not</strong> read your friends list, send friend requests, block users, or otherwise manage relationships.
+        We only use the authorized access to publish and clear your Miruro Rich Presence.
+      </li>
     </ul>
 
     <p><strong>Miruro activity (website content / activity)</strong></p>
