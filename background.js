@@ -333,9 +333,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+function senderIsMiruroTab(sender) {
+  const url = sender?.tab?.url || sender?.url || "";
+  if (!url)
+    return false;
+  // Extension pages (popup) are never Miruro content drivers.
+  if (String(url).startsWith("chrome-extension:") || String(url).startsWith("moz-extension:"))
+    return false;
+  return isMiruroUrl(url);
+}
+
 async function handleMessage(message, sender) {
   // Never await storage on the playback hot path — that made rapid seeks feel
   // randomly slow. Token hydrate happens inside push only if memory is cold.
+  const fromPage = ["claim", "presence", "playback", "browse", "clear", "leave"].includes(message?.type);
+  if (fromPage && !senderIsMiruroTab(sender))
+    return { ok: false, error: "ignored non-miruro sender" };
+
   switch (message?.type) {
     case "getStatus":
       await Promise.all([hydrate({ force: true }), ensureDevBuildFlag()]);
@@ -1615,7 +1629,9 @@ function buildWatchActivity(presence, playback) {
   if (!presence?.title)
     return null;
 
-  const details = String(presence.title).trim().slice(0, 128);
+  const details = sanitizePresenceText(presence.title, 128);
+  if (!details)
+    return null;
   const episode = presence.episode || 1;
   let state = `EP. ${episode}`;
 
@@ -1623,7 +1639,7 @@ function buildWatchActivity(presence, playback) {
     const prefix = `${state}: "`;
     const suffix = `"`;
     const max = 128 - prefix.length - suffix.length;
-    const epTitle = String(presence.episodeTitle).replace(/\s+/g, " ").trim().slice(0, Math.max(0, max));
+    const epTitle = sanitizePresenceText(presence.episodeTitle, Math.max(0, max));
     if (epTitle)
       state = `${prefix}${epTitle}${suffix}`;
   }
@@ -1694,12 +1710,30 @@ function hasValidPlayback(playback) {
   );
 }
 
+const COVER_HOST_ALLOW =
+  /(^|\.)(miruro\.cx|anilist\.co|anilistcdn\.com|myanimelist\.net|cdn\.myanimelist\.net|kitsu\.io|media\.kitsu\.io|discordapp\.com|discordapp\.net|discord\.com|imgur\.com|i\.imgur\.com|image\.tmdb\.org|themoviedb\.org|wp\.com|cloudfront\.net|bunnycdn\.com|b-cdn\.net)$/i;
+
+function sanitizePresenceText(value, max = 128) {
+  return String(value || "")
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
+}
+
 function sanitizeCover(cover) {
   if (!cover || typeof cover !== "string")
     return null;
-  if (cover.startsWith("https://") || cover.startsWith("http://"))
-    return cover.slice(0, 256);
-  return null;
+  try {
+    const u = new URL(cover.trim());
+    if (u.protocol !== "https:")
+      return null;
+    if (!COVER_HOST_ALLOW.test(u.hostname))
+      return null;
+    return u.toString().slice(0, 256);
+  } catch {
+    return null;
+  }
 }
 
 function isMiruroHost(hostname) {
@@ -1763,15 +1797,41 @@ async function upsertHeadlessSession(accessToken, activity, token) {
   return json;
 }
 
-async function deleteHeadlessSession(accessToken, token) {
+async function deleteHeadlessSession(accessToken, token, { keepalive = false } = {}) {
   await fetch(`${API_BASE}/users/@me/headless-sessions/delete`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json"
     },
-    body: JSON.stringify({ token })
+    body: JSON.stringify({ token }),
+    keepalive
   });
+}
+
+/** Best-effort clear during browser quit — keepalive so the request can outlive the SW. */
+async function clearPresenceKeepalive() {
+  const accessToken = tokens?.access_token || null;
+  const token = sessionToken;
+  if (!accessToken || !token)
+    return;
+  sessionToken = null;
+  lastActivityKey = null;
+  pageMode = "idle";
+  presenceData = null;
+  playbackData = null;
+  activeTabId = null;
+  try {
+    chrome.storage.local.set({
+      [STORAGE_KEYS.sessionToken]: null,
+      [STORAGE_KEYS.presenceState]: null
+    });
+  } catch { /* ignore */ }
+  try {
+    await deleteHeadlessSession(accessToken, token, { keepalive: true });
+  } catch (err) {
+    console.warn("clearPresenceKeepalive:", err);
+  }
 }
 
 async function clearPresence() {
@@ -1796,6 +1856,20 @@ async function clearPresence() {
     setBadge("on");
 }
 
+async function clearStaleSessionIfNoMiruro() {
+  if (!sessionToken)
+    return;
+  if (await findMiruroTab())
+    return;
+  rpcLog("clearing stale Discord session (no Miruro tabs)");
+  await clearPresence();
+  pageMode = "idle";
+  presenceData = null;
+  playbackData = null;
+  activeTabId = null;
+  persistPresenceState();
+}
+
 function setBadge(mode) {
   const map = {
     off: { text: "", color: "#666666" },
@@ -1811,8 +1885,27 @@ function setBadge(mode) {
   chrome.action.setBadgeBackgroundColor({ color: cfg.color });
 }
 
-hydrate().then(() => {
-  setBadge(tokens?.access_token ? "on" : "off");
+// Last browser window closed — beforeunload often never reaches us.
+chrome.windows.onRemoved.addListener(() => {
+  chrome.windows.getAll()
+    .then((wins) => {
+      if (!wins.length)
+        return clearPresenceKeepalive();
+    })
+    .catch(() => {});
+});
+
+// Service worker / event page going away.
+if (chrome.runtime.onSuspend) {
+  chrome.runtime.onSuspend.addListener(() => {
+    clearPresenceKeepalive().catch(() => {});
+  });
+}
+
+hydrate().then(async () => {
+  setBadge(tokens?.access_token ? (presenceEnabled ? "on" : "paused") : "off");
   armSessionKeepalive();
   warmAuth();
+  // Browser kill / crash often skips leave — drop leftover headless RPC on boot.
+  await clearStaleSessionIfNoMiruro();
 }).catch(() => {});

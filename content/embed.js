@@ -4,6 +4,31 @@
   if (window === window.top)
     return;
 
+  // Only run inside iframes under Miruro — never scrape video on arbitrary sites.
+  function framedByMiruro() {
+    try {
+      const ancestors = location.ancestorOrigins;
+      if (ancestors && ancestors.length) {
+        for (let i = 0; i < ancestors.length; i++) {
+          try {
+            if (/(^|\.)miruro\.cx$/i.test(new URL(ancestors[i]).hostname))
+              return true;
+          } catch { /* continue */ }
+        }
+        return false;
+      }
+    } catch { /* Firefox may lack ancestorOrigins */ }
+    try {
+      const ref = document.referrer;
+      if (ref && /(^|\.)miruro\.cx$/i.test(new URL(ref).hostname))
+        return true;
+    } catch { /* ignore */ }
+    return false;
+  }
+
+  if (!framedByMiruro())
+    return;
+
   const POLL_MS = 500;
   const SEEK_DRIFT_S = 2.5;
   const HITCH_MS = 8000;

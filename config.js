@@ -22,9 +22,7 @@ export const ACTIVITY = {
   // miruro: from GET /oauth2/applications/{id}/assets
   assetId: "1521633309145174119",
   assetUrl: `https://cdn.discordapp.com/app-assets/${CLIENT_ID}/1521633309145174119.png`,
-  // Medium white glyphs + some transparent padding (Discord badge size is fixed).
-  playUrl:
-    "https://images.weserv.nl/?url=gist.githubusercontent.com%2FD4rkov%2F9d98e11b7937162b12892208cc8ba96b%2Fraw%2Ff8c0df780ce94927d8339074d922c809a7091052%2Fplay.svg&output=png&w=512&h=512&t=1793746388",
-  pauseUrl:
-    "https://images.weserv.nl/?url=gist.githubusercontent.com%2FD4rkov%2F9d98e11b7937162b12892208cc8ba96b%2Fraw%2F638131a7adbdfb6079951ea71f313c65ade9b149%2Fpause.svg&output=png&w=512&h=512&t=1793746388"
+  // small_image — Discord app art assets (play-mid2 / pause-mid).
+  playUrl: `https://cdn.discordapp.com/app-assets/${CLIENT_ID}/1567356634215481375.png`,
+  pauseUrl: `https://cdn.discordapp.com/app-assets/${CLIENT_ID}/1567355441883914363.png`
 };

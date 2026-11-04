@@ -482,7 +482,6 @@
   let hitchActive = false;
   let havePlaybackTime = false;
   let playbackSeq = 0;
-  let lastEmbedSeq = 0;
   // Must be well above a normal 1s poll advance or every tick becomes "seek".
   const SEEK_DRIFT_S = 2.5;
 
@@ -760,35 +759,6 @@
     knownDuration = local.duration;
     ingestPlayback(local, local.source || "video");
   }
-
-  // Embed iframe relay (same path the tray userscript used).
-  window.addEventListener("message", (event) => {
-    if (event.data?.type !== "miruro-rpc-playback")
-      return;
-    if (!isWatchPage())
-      return;
-    const currentTime = Number(event.data.currentTime);
-    const duration = Number(event.data.duration);
-    if (!Number.isFinite(duration) || duration <= 0)
-      return;
-
-    const seq = Number(event.data.seq) || 0;
-    if (seq && seq <= lastEmbedSeq)
-      return;
-    if (seq)
-      lastEmbedSeq = seq;
-
-    const kind = String(event.data.kind || "");
-    ingestPlayback(
-      {
-        currentTime: Number.isFinite(currentTime) ? currentTime : 0,
-        duration,
-        paused: Boolean(event.data.paused)
-      },
-      "embed",
-      kind
-    );
-  });
 
   // SPA navigations
   let lastHref = location.href;
