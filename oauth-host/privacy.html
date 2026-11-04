@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Miruro RPC — Privacy Policy</title>
+  <style>
+    :root {
+      color-scheme: dark light;
+      --bg: #0f1115;
+      --fg: #f2f3f5;
+      --muted: #9aa3b2;
+      --line: #2a2f3a;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f7f8fa;
+        --fg: #15181f;
+        --muted: #5b6472;
+        --line: #d8dde6;
+      }
+    }
+    body {
+      margin: 0;
+      font: 16px/1.55 system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    main {
+      max-width: 42rem;
+      margin: 0 auto;
+      padding: 2rem 1.25rem 3rem;
+    }
+    h1 { font-size: 1.6rem; margin: 0 0 0.35rem; }
+    h2 { font-size: 1.1rem; margin: 1.75rem 0 0.5rem; }
+    p, li { color: var(--muted); }
+    strong { color: var(--fg); font-weight: 600; }
+    .meta { font-size: 0.9rem; margin-bottom: 1.5rem; }
+    hr { border: 0; border-top: 1px solid var(--line); margin: 1.5rem 0; }
+    a { color: inherit; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Miruro RPC Privacy Policy</h1>
+    <p class="meta">Last updated: November 4, 2026</p>
+
+    <p>
+      Miruro RPC (“the extension”) is a browser add-on that shows your
+      <strong>Miruro</strong> watching activity as <strong>Discord Rich Presence</strong>.
+      This policy explains what information is handled and where it goes.
+    </p>
+
+    <h2>Summary</h2>
+    <ul>
+      <li>We do <strong>not</strong> run an analytics service or sell your data.</li>
+      <li>Discord login tokens and preferences are stored <strong>locally</strong> in the browser.</li>
+      <li>Watch/browse activity is sent only to <strong>Discord</strong>, to update your presence.</li>
+      <li>The extension reads information from <strong>miruro.cx</strong> pages you open.</li>
+    </ul>
+
+    <h2>Data the extension uses</h2>
+    <p><strong>Discord account (authentication)</strong></p>
+    <ul>
+      <li>When you tap Connect Discord, you sign in with Discord OAuth (PKCE).</li>
+      <li>Access and refresh tokens, and basic profile fields needed to show you are signed in, are stored in the browser’s extension storage.</li>
+      <li>Tokens are used only to talk to Discord’s API (login refresh and presence).</li>
+    </ul>
+
+    <p><strong>Miruro activity (website content / activity)</strong></p>
+    <ul>
+      <li>On Miruro pages, the extension may read page content such as anime title, episode number, episode title, cover image URL, watch page URL, and playback position.</li>
+      <li>That information is used to build your Discord Rich Presence (and optional “hide this anime” / presence on-off settings stored locally).</li>
+    </ul>
+
+    <p><strong>Presence session</strong></p>
+    <ul>
+      <li>The extension creates or updates a Discord headless presence session so friends can see what you are watching or browsing.</li>
+      <li>Clearing presence (for example leaving Miruro, turning presence off, or on Android minimizing Firefox) asks Discord to remove that session.</li>
+    </ul>
+
+    <h2>Where data is sent</h2>
+    <ul>
+      <li><strong>Discord</strong> (<code>discord.com</code> API) — OAuth token exchange and Rich Presence updates.</li>
+      <li><strong>OAuth callback page</strong> (<code>https://d4rkov.github.io/miruro-rpc-oauth/</code>) — used on Firefox for Android so Discord can redirect after login. The authorization code appears in the page URL briefly; the extension reads it locally to finish login. That page does not store your Discord password or tokens.</li>
+    </ul>
+    <p>
+      The extension does <strong>not</strong> send your Miruro activity or Discord tokens to a Miruro RPC backend or to the developer for analytics.
+    </p>
+
+    <h2>Data stored on your device</h2>
+    <ul>
+      <li>Discord tokens and signed-in user display info</li>
+      <li>Presence preferences (enabled/disabled, muted anime titles)</li>
+      <li>Temporary OAuth/PKCE state during login</li>
+      <li>Session identifiers needed to update or clear Discord presence</li>
+    </ul>
+    <p>
+      Disconnecting Discord in the extension removes stored auth data from extension storage (as far as the browser allows). Uninstalling the extension removes its local storage.
+    </p>
+
+    <h2>Permissions (why they exist)</h2>
+    <ul>
+      <li><strong>storage</strong> — save login and preferences on device</li>
+      <li><strong>identity / tabs</strong> — Discord login (desktop identity window; Android uses a tab + callback)</li>
+      <li><strong>alarms</strong> — keep presence reliable when the browser sleeps background scripts</li>
+      <li><strong>Host access</strong> to Miruro, Discord, and the OAuth callback host — required for the features above</li>
+    </ul>
+
+    <h2>Children</h2>
+    <p>
+      The extension is not directed at children. Use Discord and Miruro according to their own terms and age rules.
+    </p>
+
+    <h2>Third-party services</h2>
+    <p>
+      Discord’s and Miruro’s own privacy policies apply to their services. This policy only covers the Miruro RPC extension.
+    </p>
+
+    <h2>Changes</h2>
+    <p>
+      If this policy changes in a meaningful way, the “Last updated” date above will change. Continued use after an update means you accept the revised policy.
+    </p>
+
+    <h2>Contact</h2>
+    <p>
+      Questions about this policy: open an issue on the
+      <a href="https://github.com/D4rkov/Miruro-RPC">Miruro-RPC GitHub repository</a>
+      or contact the maintainer via that project.
+    </p>
+
+    <hr />
+    <p class="meta">Miruro RPC is not affiliated with Discord or Miruro.</p>
+  </main>
+</body>
+</html>
