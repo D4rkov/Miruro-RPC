@@ -11,6 +11,8 @@ const STORAGE_KEYS = {
   tokens: "tokens",
   user: "user",
   sessionToken: "sessionToken",
+  /** Recent headless tokens — delete-all on clear so orphans aren't lost. */
+  sessionTokenHistory: "sessionTokenHistory",
   oauthPending: "oauthPending",
   authPending: "authPending",
   lastAuthError: "lastAuthError",
@@ -25,6 +27,8 @@ let tokens = null;
 /** @type {{ id: string, username: string, global_name?: string, avatar?: string } | null} */
 let user = null;
 let sessionToken = null;
+/** Ring of recent headless session tokens (lost primary → still deletable). */
+let sessionTokenHistory = [];
 let lastAuthError = null;
 let lastPushError = null;
 let authPending = false;
@@ -38,6 +42,8 @@ let activeTabId = null;
 let pageMode = "idle"; // idle | browse | watch
 /** Master switch — when false, Discord stays clear. */
 let presenceEnabled = true;
+/** After Clear stuck RPC — ignore browse/watch posts briefly so tabs don't revive it. */
+let presenceSuppressedUntil = 0;
 /** Normalized anime titles the user does not want shared. */
 let mutedTitles = [];
 let presenceData = null;
@@ -61,7 +67,7 @@ let rateLimitRetryTimer = null;
  * abort/rate-limit death spiral (3:49 ↔ 7:34 in the logs).
  */
 let seekPin = null;
-/** embed/video beat strmcx — strmcx lags and fake-seeks after iframe scrubs. */
+/** Prefer recent trusted media; strmcx is Miruro's primary player now. */
 let lastMediaSourceAt = 0;
 let lastMediaSource = "";
 /** Debounce Discord POSTs so dual embed ticks coalesce. */
@@ -80,11 +86,13 @@ let watchAwaitingPlayback = false;
 let watchPlaybackFlushQueued = false;
 let watchPlaybackKickTimer = null;
 let watchNavFallbackTimer = null;
+let watchPlaybackKickTries = 0;
 /** Set only by the nav fallback timer so title-only POST is intentional. */
 let watchNavAllowTitleOnly = false;
 let lastNavAction = "";
 let lastNavAt = 0;
-const MEDIA_SOURCE_RANK = { embed: 3, video: 2, strmcx: 1, player: 1, clock: 0, presence: 0, unknown: 0 };
+const MEDIA_SOURCE_RANK = { video: 2, strmcx: 2, player: 1, clock: 0, presence: 0, unknown: 0 };
+const TRUSTED_MEDIA_RANK = 2;
 
 /** Ring buffer for the popup debug panel — paste these when something flakes. */
 const DEBUG_LOG_MAX = 120;
@@ -263,12 +271,19 @@ function logDiscord(ok, playback, extra = {}) {
   let shown = extra.shown || null;
   if (!shown) {
     const snap = formatPlaybackShort(playback);
-    shown = snap
-      ? `${snap.paused ? "paused" : "playing"} @ ${snap.at}`
-      : "cleared";
+    if (snap)
+      shown = `${snap.paused ? "paused" : "playing"} @ ${snap.at}`;
+    else if (pageMode === "browse")
+      shown = "browse";
+    else if (pageMode === "watch")
+      shown = `watch ${String(presenceData?.title || "").slice(0, 40)}`;
+    else
+      shown = "cleared";
   }
 
-  const forAction = extra.forAction || pendingUserAction?.action || null;
+  const forAction = extra.forAction !== undefined
+    ? extra.forAction
+    : (pendingUserAction?.action || null);
 
   if (ok) {
     rpcLog(`DISCORD  ${shown}`, {
@@ -290,7 +305,12 @@ function logDiscord(ok, playback, extra = {}) {
 const ALARM_TOKEN_REFRESH = "tokenRefresh";
 const ALARM_SESSION_KEEPALIVE = "sessionKeepalive";
 const ALARM_WATCH_FLUSH = "watchPresenceFlush";
+const ALARM_PRESENCE_FLUSH = "presenceFlush";
 const ALARM_CLEAR_RETRY = "clearPresenceRetry";
+const ALARM_CLEAR_STALE = "clearStaleSession";
+
+/** Serialize hydrates — cold SW often races boot hydrate vs first Miruro message. */
+let hydrateInFlight = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.alarms.create(ALARM_TOKEN_REFRESH, { periodInMinutes: 20 });
@@ -306,16 +326,30 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     await clearPresence({ allowRetry: true });
     return;
   }
-  if (alarm.name === ALARM_WATCH_FLUSH) {
-    await hydrate({ force: true });
-    if (pageMode !== "watch" || !presenceData?.title || !isSharingActive())
+  if (alarm.name === ALARM_CLEAR_STALE) {
+    // Only if nothing claimed Miruro during boot race.
+    if (pageMode === "idle")
+      await clearStaleSessionIfNoMiruro();
+    return;
+  }
+  if (alarm.name === ALARM_PRESENCE_FLUSH || alarm.name === ALARM_WATCH_FLUSH) {
+    // restore:false — restore→flush→alarm was an infinite browse POST storm.
+    await hydrate({ force: true, restore: false });
+    if (pageMode === "idle" || !isSharingActive())
       return;
-    // Android kills setTimeouts — alarm is the reliable watch POST.
-    if (!hasValidPlayback(playbackData) ||
-        (MEDIA_SOURCE_RANK[String(playbackData.source || "")] ?? 0) < 2)
-      watchNavAllowTitleOnly = true;
-    watchAwaitingPlayback = false;
-    lastActivityKey = null;
+    if (pageMode === "watch") {
+      if (!presenceData?.title)
+        return;
+      if (!isTrustedMedia(playbackData))
+        watchNavAllowTitleOnly = true;
+      watchAwaitingPlayback = false;
+      // Don't clear lastActivityKey here — activityKey ignores wall-clock now,
+      // so identical playing state won't re-POST and burn the rate limit.
+    } else if (pageMode === "browse") {
+      // Backup only — if browse already landed, do not POST again.
+      if (lastActivityKey && Date.now() - lastPushAt < 15_000)
+        return;
+    }
     await pushPresence();
     return;
   }
@@ -333,10 +367,50 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === activeTabId)
-    onActiveTabGone(tabId).catch((err) => console.warn("onActiveTabGone:", err));
+    onActiveTabGone(tabId, { keepalive: true }).catch((err) =>
+      console.warn("onActiveTabGone:", err)
+    );
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+function isMiruroWatchUrl(url) {
+  try {
+    const parsed = new URL(String(url));
+    return isMiruroHost(parsed.hostname) && parsed.pathname.startsWith("/watch");
+  } catch {
+    return false;
+  }
+}
+
+/** Ask the tab to re-claim — first content messages often die on a cold event page. */
+function nudgeMiruroTab(tabId) {
+  if (tabId == null)
+    return;
+  try {
+    chrome.tabs.sendMessage(tabId, { type: "resync" }).catch(() => {});
+  } catch { /* ignore */ }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const url = tab?.url || changeInfo.url || "";
+  const miruro = url && isMiruroUrl(url);
+  // Warm auth + ask content script to retry claim/presence/browse.
+  if (miruro && (changeInfo.status === "complete" || changeInfo.url)) {
+    hydrate({ restore: false })
+      .then(() => {
+        if (!tokens?.access_token)
+          return;
+        nudgeMiruroTab(tabId);
+        // Full load on a non-watch page while idle — don't wait for content script.
+        if (
+          changeInfo.status === "complete" &&
+          pageMode === "idle" &&
+          !isMiruroWatchUrl(url)
+        ) {
+          onBrowse(tabId, false);
+        }
+      })
+      .catch((err) => console.warn("miruro tab nudge:", err));
+  }
   if (tabId !== activeTabId || !changeInfo.url)
     return;
   if (!isMiruroUrl(changeInfo.url))
@@ -372,6 +446,19 @@ function clearWatchFlushAlarm() {
   } catch { /* ignore */ }
 }
 
+/** Event pages drop setTimeout — alarm is the reliable Discord POST kick. */
+function armPresenceFlushAlarm(delayMs = 500) {
+  try {
+    chrome.alarms.create(ALARM_PRESENCE_FLUSH, {
+      when: Date.now() + Math.max(250, Number(delayMs) || 500)
+    });
+  } catch {
+    chrome.alarms.create(ALARM_PRESENCE_FLUSH, {
+      delayInMinutes: Math.max(0.05, (Number(delayMs) || 500) / 60_000)
+    });
+  }
+}
+
 function warmAuth() {
   ensureAccessToken().catch(() => {});
 }
@@ -384,12 +471,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 function senderIsMiruroTab(sender) {
-  const url = sender?.tab?.url || sender?.url || "";
-  if (!url)
-    return false;
   // Extension pages (popup) are never Miruro content drivers.
+  const url = sender?.tab?.url || sender?.url || "";
   if (String(url).startsWith("chrome-extension:") || String(url).startsWith("moz-extension:"))
     return false;
+  // Content scripts are match-gated to Miruro. Firefox sometimes omits tab.url
+  // on the first message after a cold start — still trust the tab id.
+  if (!url)
+    return sender?.tab?.id != null;
   return isMiruroUrl(url);
 }
 
@@ -400,9 +489,20 @@ async function handleMessage(message, sender) {
   if (fromPage && !senderIsMiruroTab(sender))
     return { ok: false, error: "ignored non-miruro sender" };
 
+  // Cold SW: load auth before first browse/claim so Discord isn't "no token".
+  if (
+    fromPage &&
+    message?.type !== "playback" &&
+    !tokens?.access_token
+  ) {
+    await hydrate();
+  }
+
   switch (message?.type) {
     case "getStatus": {
-      await Promise.all([hydrate({ force: true }), ensureDevBuildFlag()]);
+      // restore:false — popup must not deadlock on restore→clear→hydrate.
+      // Presence fields come from live memory (content scripts drive those).
+      await Promise.all([hydrate({ force: true, restore: false }), ensureDevBuildFlag()]);
       const android = await isAndroidRuntime();
       const redirectUri =
         !android && typeof chrome.identity?.getRedirectURL === "function"
@@ -493,6 +593,48 @@ async function handleMessage(message, sender) {
     case "logout":
       await logout();
       return { ok: true };
+    case "forceClearPresence": {
+      await hydrate({ restore: false });
+      const access = await ensureAccessToken();
+      if (!access)
+        return { ok: false, error: "not logged in" };
+      if (browseFlushTimer) {
+        clearTimeout(browseFlushTimer);
+        browseFlushTimer = null;
+      }
+      if (flushDebounceTimer) {
+        clearTimeout(flushDebounceTimer);
+        flushDebounceTimer = null;
+      }
+      pushQueued = false;
+      pageMode = "idle";
+      presenceData = null;
+      playbackData = null;
+      activeTabId = null;
+      lastActivityKey = null;
+      presenceSuppressedUntil = Date.now() + 8000;
+      logYouNav("clear stuck RPC");
+      const result = await forceClearHeadlessPresence(access, { requireToken: true });
+      const ok = Boolean(result?.ok);
+      if (ok)
+        setPushError(null);
+      else
+        setPushError(result?.error || "Couldn't clear Discord presence");
+      logDiscord(ok, null, {
+        shown: ok ? "cleared" : (result?.orphan ? "orphan (no token)" : "clear failed"),
+        forAction: "clear stuck RPC",
+        error: result?.error || null
+      });
+      persistPresenceState();
+      setBadge(tokens?.access_token ? (presenceEnabled ? "on" : "paused") : "off");
+      return {
+        ok,
+        orphan: Boolean(result?.orphan),
+        error: result?.error || null,
+        deleted: result?.deleted || 0,
+        lastPushError
+      };
+    }
     case "testPresence":
       await ensureDevBuildFlag();
       if (!isDevBuild)
@@ -622,16 +764,36 @@ async function applySharingGate({ clear = false, resume = false } = {}) {
   return { ok: true, ...(await sharingStatusPayload()) };
 }
 
-async function hydrate({ force = false } = {}) {
+async function hydrate(opts = {}) {
+  // Wait for an in-flight load (first Miruro message often races boot hydrate).
+  // Do NOT no-op concurrent callers — that skipped auth and Discord never POSTed
+  // until the popup woke the worker again.
+  if (hydrateInFlight) {
+    await hydrateInFlight;
+    if (!opts.force && tokens?.access_token)
+      return;
+  }
+
+  const done = hydrateNow(opts).finally(() => {
+    if (hydrateInFlight === done)
+      hydrateInFlight = null;
+  });
+  hydrateInFlight = done;
+  return done;
+}
+
+async function hydrateNow({ force = false, restore = true } = {}) {
   // Always re-read sessionToken — Android wakeups often have auth in memory
   // but a newer token only in storage (or the reverse).
   if (!force && tokens && user) {
     const bit = await chrome.storage.local.get([
       STORAGE_KEYS.sessionToken,
+      STORAGE_KEYS.sessionTokenHistory,
       STORAGE_KEYS.presenceEnabled,
       STORAGE_KEYS.mutedTitles
     ]);
     sessionToken = bit[STORAGE_KEYS.sessionToken] || null;
+    sessionTokenHistory = normalizeTokenHistory(bit[STORAGE_KEYS.sessionTokenHistory], sessionToken);
     if (bit[STORAGE_KEYS.presenceEnabled] !== undefined)
       presenceEnabled = bit[STORAGE_KEYS.presenceEnabled] !== false;
     if (Array.isArray(bit[STORAGE_KEYS.mutedTitles]))
@@ -642,6 +804,7 @@ async function hydrate({ force = false } = {}) {
     STORAGE_KEYS.tokens,
     STORAGE_KEYS.user,
     STORAGE_KEYS.sessionToken,
+    STORAGE_KEYS.sessionTokenHistory,
     STORAGE_KEYS.authPending,
     STORAGE_KEYS.lastAuthError,
     STORAGE_KEYS.lastPushError,
@@ -651,6 +814,7 @@ async function hydrate({ force = false } = {}) {
   tokens = stored[STORAGE_KEYS.tokens] || null;
   user = stored[STORAGE_KEYS.user] || null;
   sessionToken = stored[STORAGE_KEYS.sessionToken] || null;
+  sessionTokenHistory = normalizeTokenHistory(stored[STORAGE_KEYS.sessionTokenHistory], sessionToken);
   authPending = Boolean(stored[STORAGE_KEYS.authPending]);
   lastAuthError = stored[STORAGE_KEYS.lastAuthError] || null;
   lastPushError = stored[STORAGE_KEYS.lastPushError] || null;
@@ -658,7 +822,42 @@ async function hydrate({ force = false } = {}) {
   mutedTitles = Array.isArray(stored[STORAGE_KEYS.mutedTitles])
     ? stored[STORAGE_KEYS.mutedTitles].map(normalizeTitleKey).filter(Boolean)
     : [];
-  await restorePresenceState();
+  // Skip during clear — restoring the just-left snapshot re-posts stale RPC.
+  if (restore)
+    await restorePresenceState();
+}
+
+function normalizeTokenHistory(list, primary = null) {
+  const out = [];
+  for (const token of [...(Array.isArray(list) ? list : []), primary]) {
+    if (token && !out.includes(token))
+      out.push(token);
+  }
+  return out.slice(-8);
+}
+
+async function rememberSessionToken(token) {
+  if (!token)
+    return;
+  sessionToken = token;
+  sessionTokenHistory = normalizeTokenHistory(sessionTokenHistory, token);
+  try {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.sessionToken]: sessionToken,
+      [STORAGE_KEYS.sessionTokenHistory]: sessionTokenHistory
+    });
+  } catch { /* ignore */ }
+}
+
+async function clearStoredSessionTokens() {
+  sessionToken = null;
+  sessionTokenHistory = [];
+  try {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.sessionToken]: null,
+      [STORAGE_KEYS.sessionTokenHistory]: []
+    });
+  } catch { /* ignore */ }
 }
 
 function startLogin() {
@@ -694,7 +893,8 @@ async function persistAuth() {
   await chrome.storage.local.set({
     [STORAGE_KEYS.tokens]: tokens,
     [STORAGE_KEYS.user]: user,
-    [STORAGE_KEYS.sessionToken]: sessionToken
+    [STORAGE_KEYS.sessionToken]: sessionToken,
+    [STORAGE_KEYS.sessionTokenHistory]: sessionTokenHistory
   });
 }
 
@@ -1026,7 +1226,9 @@ function normalizeTokens(json, previousRefresh) {
 }
 
 async function ensureAccessToken() {
-  await hydrate();
+  // Avoid re-entering hydrate from restore→flush→push (deadlock with self-wait).
+  if (!tokens?.access_token || Date.now() >= (tokens.expires_at || 0))
+    await hydrate({ restore: false });
   if (!tokens?.access_token)
     return null;
   if (Date.now() < (tokens.expires_at || 0))
@@ -1051,15 +1253,16 @@ async function fetchUser(accessToken) {
 }
 
 async function logout() {
-  await hydrate();
-  if (sessionToken && tokens?.access_token) {
-    try {
-      await deleteHeadlessSession(tokens.access_token, sessionToken);
-    } catch { /* ignore */ }
-  }
+  await hydrate({ restore: false });
+  try {
+    const access = tokens?.access_token || (await ensureAccessToken().catch(() => null));
+    if (access)
+      await forceClearHeadlessPresence(access);
+  } catch { /* ignore */ }
   tokens = null;
   user = null;
   sessionToken = null;
+  sessionTokenHistory = [];
   activeTabId = null;
   pageMode = "idle";
   presenceData = null;
@@ -1068,7 +1271,8 @@ async function logout() {
   await chrome.storage.local.remove([
     STORAGE_KEYS.tokens,
     STORAGE_KEYS.user,
-    STORAGE_KEYS.sessionToken
+    STORAGE_KEYS.sessionToken,
+    STORAGE_KEYS.sessionTokenHistory
   ]);
   setBadge("off");
 }
@@ -1081,7 +1285,14 @@ function onClaim(tabId, mode) {
   activeTabId = tabId;
   if (mode === "browse")
     return onBrowse(tabId);
-  // Watch claim: stay on current presence (usually browse) until presence arrives.
+  // Cancel deferred catalog browse — next watch will replace Discord instead.
+  if (browseFlushTimer) {
+    clearTimeout(browseFlushTimer);
+    browseFlushTimer = null;
+  }
+  // Watch claim: stay on current presence (usually previous watch) until presence arrives.
+  // Alarm backup — if the follow-up presence message is lost on a cold SW, still kick.
+  armWatchFlushAlarm(1500);
   persistPresenceState();
   return { ok: true };
 }
@@ -1102,7 +1313,12 @@ function presenceEnrichKey(data) {
     return "";
   return JSON.stringify({
     episodeTitle: String(data.episodeTitle || "").trim().toLowerCase(),
-    cover: String(data.cover || "").trim()
+    cover: String(data.cover || "").trim(),
+    anilistId: Number(data.anilistId) || 0,
+    titles: Array.isArray(data.titles) ? data.titles.map((t) => String(t).trim().toLowerCase()) : [],
+    anilistTitles: Array.isArray(data.anilistTitles)
+      ? data.anilistTitles.map((t) => String(t).trim().toLowerCase())
+      : []
   });
 }
 
@@ -1132,6 +1348,17 @@ function onPresence(tabId, data) {
   const enrichChanged = presenceEnrichKey(data) !== presenceEnrichKey(presenceData);
   const becameWatch = pageMode !== "watch";
   pageMode = "watch";
+  // Keep AniList shorts across cover/title-alt enrichments of the same show.
+  if (
+    data &&
+    presenceData &&
+    !metaChanged &&
+    Array.isArray(presenceData.anilistTitles) &&
+    presenceData.anilistTitles.length &&
+    !Array.isArray(data.anilistTitles)
+  ) {
+    data.anilistTitles = presenceData.anilistTitles;
+  }
   presenceData = data || null;
   browseStart = null;
 
@@ -1149,6 +1376,7 @@ function onPresence(tabId, data) {
     playbackMuteUntil = Date.now() + (tabChanged || becameWatch ? 450 : 1800);
     watchAwaitingPlayback = true;
     watchPlaybackFlushQueued = false;
+    watchPlaybackKickTries = 0;
     // Presence scrape often has the focused tab's time already (iframe may be
     // throttled after backgrounding and won't emit a fresh "play").
     const seed = seedPlaybackFromPresence(data);
@@ -1159,9 +1387,15 @@ function onPresence(tabId, data) {
     }
     scheduleWatchPlaybackKick(Math.max(0, playbackMuteUntil - Date.now()) + 60);
   } else if (enrichChanged) {
-    // Cover / episode title arrived after the first Android title-only POST.
-    lastActivityKey = null;
-    flushPresence({ urgent: true });
+    // Cover / ep-title / AniList alts — only POST if Discord text/art would change.
+    const before = buildWatchActivity(presenceData, playbackData);
+    const after = buildWatchActivity(data, playbackData);
+    const beforeKey = before ? activityKey(before, playbackData) : "";
+    const afterKey = after ? activityKey(after, playbackData) : "";
+    if (beforeKey !== afterKey) {
+      lastActivityKey = null;
+      flushPresence({ urgent: true, bypassGap: true });
+    }
     persistPresenceState();
     return { ok: true };
   }
@@ -1202,18 +1436,96 @@ function onPresence(tabId, data) {
     armWatchFlushAlarm(fallbackIn);
   }, navDelay);
 
-  // Phone: don't wait on iframes/timers — post title ASAP so Discord leaves browse.
-  isAndroidRuntime().then((android) => {
-    if (!android || pageMode !== "watch" || !presenceData?.title)
-      return;
-    watchNavAllowTitleOnly = true;
-    lastActivityKey = null;
-    armWatchFlushAlarm(800);
-    flushPresence({ urgent: true });
-  }).catch(() => {});
+  // Cancel a pending browse POST if we bounced watch→browse→watch.
+  if (browseFlushTimer) {
+    clearTimeout(browseFlushTimer);
+    browseFlushTimer = null;
+  }
+
+  // Leave browse ASAP — but if the title would hard-truncate, wait briefly for
+  // AniList (TenSura) so Discord doesn't flash "That Time I Got on Miruro".
+  scheduleWatchTitleFlush(presenceData);
 
   persistPresenceState();
   return { ok: true };
+}
+
+function titleNeedsAnilistShort(fullTitle, extraTitles = []) {
+  const full = sanitizePresenceText(fullTitle, 128);
+  if (!full)
+    return false;
+  const max = nameTitleMax();
+  const pool = [full, ...(extraTitles || [])];
+  for (const raw of pool) {
+    for (const variant of heuristicTitleVariants(raw)) {
+      const clean = sanitizePresenceText(variant, 128);
+      // Natural short only — truncation ("That Time I Got") still waits for AniList.
+      if (
+        clean &&
+        clean.length <= max &&
+        !isWeakShortTitle(clean, full) &&
+        latinRatio(clean) >= 0.55 &&
+        !isAwkwardEnglishTrunc(clean)
+      ) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+function flushWatchTitlePresence() {
+  if (pageMode !== "watch" || !presenceData?.title)
+    return;
+  pendingUserAction = null;
+  watchNavAllowTitleOnly = true;
+  lastActivityKey = null;
+  armWatchFlushAlarm(800);
+  // bypassGap: browse→watch shouldn't sit behind the 3.5s anti-429 spacing.
+  flushPresence({ urgent: true, bypassGap: true });
+}
+
+function scheduleWatchTitleFlush(presence) {
+  const data = presence || presenceData;
+  if (!data?.title) {
+    flushWatchTitlePresence();
+    return;
+  }
+  if (
+    (Array.isArray(data.anilistTitles) && data.anilistTitles.length) ||
+    !titleNeedsAnilistShort(data.title, data.titles)
+  ) {
+    enrichWatchTitlesFromAnilist(data, { flush: false }).catch(() => {});
+    flushWatchTitlePresence();
+    return;
+  }
+
+  let settled = false;
+  const finish = () => {
+    if (settled)
+      return;
+    settled = true;
+    flushWatchTitlePresence();
+  };
+
+  // Wait for TenSura-style AniList shorts before the first watch POST so we
+  // don't flash a hard-truncated English name, then upgrade a beat later.
+  enrichWatchTitlesFromAnilist(data, { flush: false })
+    .then((changed) => {
+      if (!settled) {
+        finish();
+        return;
+      }
+      if (changed) {
+        lastActivityKey = null;
+        flushPresence({ urgent: true, bypassGap: true });
+      }
+    })
+    .catch(() => {
+      if (!settled)
+        finish();
+    });
+  setTimeout(finish, 1600);
 }
 
 function onPlayback(tabId, data) {
@@ -1232,6 +1544,11 @@ function clearWatchPlaybackTimers() {
   clearWatchFlushAlarm();
 }
 
+function isTrustedMedia(data) {
+  return hasValidPlayback(data) &&
+    (MEDIA_SOURCE_RANK[String(data?.source || "")] ?? 0) >= TRUSTED_MEDIA_RANK;
+}
+
 /** After mute, force one progress POST with title + time (no 00:00 intermediate). */
 function scheduleWatchPlaybackKick(delayMs) {
   if (watchPlaybackKickTimer)
@@ -1247,11 +1564,16 @@ function scheduleWatchPlaybackKick(delayMs) {
       return;
     }
     const data = playbackData;
-    if (!hasValidPlayback(data) || (MEDIA_SOURCE_RANK[String(data.source || "")] ?? 0) < 2) {
-      // Iframe still waking from background throttle — retry, don't give up.
-      scheduleWatchPlaybackKick(400);
+    if (!isTrustedMedia(data)) {
+      // Player still waking — retry a few times, then let nav fallback title-post.
+      watchPlaybackKickTries += 1;
+      if (watchPlaybackKickTries <= 12) {
+        scheduleWatchPlaybackKick(400);
+        return;
+      }
       return;
     }
+    watchPlaybackKickTries = 0;
     applyPlayback(activeTabId, {
       ...data,
       kind: data.paused ? "pause" : "play",
@@ -1270,7 +1592,7 @@ function scheduleWatchNavFallback(delayMs) {
       return;
     if (pageMode !== "watch" || !presenceData?.title)
       return;
-    if (hasValidPlayback(playbackData) && (MEDIA_SOURCE_RANK[String(playbackData.source || "")] ?? 0) >= 2) {
+    if (isTrustedMedia(playbackData)) {
       scheduleWatchPlaybackKick(50);
       return;
     }
@@ -1365,16 +1687,24 @@ function applyPlayback(tabId, data) {
   const rank = MEDIA_SOURCE_RANK[source] ?? 0;
   const trustedRank = MEDIA_SOURCE_RANK[lastMediaSource] ?? -1;
   const kind = String(next.kind || "");
-  const isPausePlay = kind === "play" || kind === "pause" || kind === "ended" || kind === "resume";
+  const isPausePlay =
+    kind === "play" ||
+    kind === "pause" ||
+    kind === "ended" ||
+    kind === "resume" ||
+    kind === "hitch";
   let explicitSeek = kind === "seek";
+  // Hitch / stall pause must land as paused on Discord.
+  if ((kind === "hitch" || kind === "pause" || kind === "ended") && !next.paused)
+    next.paused = true;
 
   // During show-switch mute: buffer trusted media from this tab, don't POST.
   // Old iframe play events used to punch through and stamp the wrong time.
   // User scrub is the only early unmute.
   if (Date.now() < playbackMuteUntil) {
-    if (rank >= 2 && explicitSeek) {
+    if (rank >= TRUSTED_MEDIA_RANK && explicitSeek) {
       playbackMuteUntil = 0;
-    } else if (rank >= 2 && next.duration > 1) {
+    } else if (rank >= TRUSTED_MEDIA_RANK && next.duration > 1) {
       playbackData = next;
       lastMediaSource = source;
       lastMediaSourceAt = Date.now();
@@ -1384,11 +1714,12 @@ function applyPlayback(tabId, data) {
     }
   }
 
-  // While the iframe player is active, ignore strmcx/clock — they keep a stale
-  // timeline and emit fake "seek" every time embed jumps (rate-limit death).
+  // Ignore weaker clock/player ticks while a trusted source is live —
+  // but never drop explicit pause/play (UI click when <video> is unreachable).
   if (
-    rank < 2 &&
-    trustedRank >= 2 &&
+    !isPausePlay &&
+    rank < TRUSTED_MEDIA_RANK &&
+    trustedRank >= TRUSTED_MEDIA_RANK &&
     Date.now() - lastMediaSourceAt < 8000
   ) {
     return { ok: true, ignored: "weaker-source" };
@@ -1438,7 +1769,7 @@ function applyPlayback(tabId, data) {
     };
   }
 
-  if (rank >= 2) {
+  if (rank >= TRUSTED_MEDIA_RANK) {
     lastMediaSource = source;
     lastMediaSourceAt = Date.now();
   }
@@ -1455,7 +1786,7 @@ function applyPlayback(tabId, data) {
   const firstPlayback =
     watchAwaitingPlayback &&
     !watchPlaybackFlushQueued &&
-    rank >= 2 &&
+    rank >= TRUSTED_MEDIA_RANK &&
     Number.isFinite(next.duration) &&
     next.duration > 1;
 
@@ -1465,11 +1796,13 @@ function applyPlayback(tabId, data) {
 
   const actionKind = explicitSeek
     ? "seek"
-    : (isPausePlay || firstPlayback || next.force)
-      ? (kind || (next.paused ? "pause" : "play"))
-      : next.paused
-        ? "pause"
-        : "play";
+    : kind === "hitch" || kind === "ended"
+      ? "pause"
+      : (isPausePlay || firstPlayback || next.force)
+        ? (kind || (next.paused ? "pause" : "play"))
+        : next.paused
+          ? "pause"
+          : "play";
 
   const shouldFlush = logYou(actionKind, next);
 
@@ -1492,10 +1825,17 @@ function applyPlayback(tabId, data) {
   return { ok: true };
 }
 
+let browseFlushTimer = null;
+/** After watch→browse, wait this long before Discord browse — rapid anime
+ *  hops cancel this and go straight to the next watch (avoids 429). */
+const BROWSE_AFTER_WATCH_MS = 1000;
+
 function onBrowse(tabId, tick = false) {
   if (tabId == null)
     return { ok: false };
   activeTabId = tabId;
+  const fromIdle = pageMode === "idle";
+  const fromWatch = pageMode === "watch";
   const becameBrowse = pageMode !== "browse";
   pageMode = "browse";
   presenceData = null;
@@ -1512,11 +1852,29 @@ function onBrowse(tabId, tick = false) {
   browseStart ??= Date.now();
   armSessionKeepalive();
   warmAuth();
-  // Tick = keepalive ping only (no Discord POST). Push once when entering browse.
-  if (!tick && (becameBrowse || !lastActivityKey)) {
-    logYouNav(becameBrowse ? "browse Miruro" : "browse Miruro (refresh)");
-    lastActivityKey = null;
-    flushPresence({ urgent: true });
+  // Tick = keepalive ping only (no Discord POST).
+  // Already browsing with a Discord browse up — don't queue another POST.
+  if (!tick && becameBrowse) {
+    if (browseFlushTimer) {
+      clearTimeout(browseFlushTimer);
+      browseFlushTimer = null;
+    }
+    if (fromWatch) {
+      // Keep the previous watch on Discord while hopping shows. Only POST
+      // browse if they actually linger on the catalog.
+      browseFlushTimer = setTimeout(() => {
+        browseFlushTimer = null;
+        if (pageMode !== "browse")
+          return;
+        logYouNav("browse Miruro");
+        lastActivityKey = null;
+        flushPresence({ urgent: true });
+      }, BROWSE_AFTER_WATCH_MS);
+    } else {
+      logYouNav("browse Miruro");
+      lastActivityKey = null;
+      flushPresence({ urgent: true, bypassGap: fromIdle });
+    }
   }
   persistPresenceState();
   return { ok: true };
@@ -1538,6 +1896,11 @@ function persistPresenceState() {
 }
 
 async function restorePresenceState() {
+  // Content script already claimed this worker — don't clobber live browse/watch
+  // with a disk snapshot (boot hydrate was wiping RPC ~3s after browse).
+  if (pageMode !== "idle")
+    return;
+
   const stored = await chrome.storage.local.get(STORAGE_KEYS.presenceState);
   const snap = stored[STORAGE_KEYS.presenceState];
   if (!snap)
@@ -1548,22 +1911,39 @@ async function restorePresenceState() {
   playbackData = snap.playbackData || null;
   browseStart = snap.browseStart || null;
   dotFrame = Number(snap.dotFrame) || 0;
-  lastActivityKey = snap.lastActivityKey ?? null;
+  // Don't restore lastActivityKey — it skips Discord upserts after SW reload.
+  lastActivityKey = null;
   if (snap.sessionToken)
     sessionToken = snap.sessionToken;
 
   // Don't resurrect RPC after a restart/suspend if the Miruro tab is gone.
   if (pageMode !== "idle" && !(await isLiveMiruroTab(activeTabId))) {
-    activeTabId = null;
-    pageMode = "idle";
-    presenceData = null;
-    playbackData = null;
-    browseStart = null;
-    lastActivityKey = null;
-    lastSentPlayback = null;
+    const next = await findMiruroTab();
+    if (next != null) {
+      activeTabId = next;
+      persistPresenceState();
+    } else {
+      activeTabId = null;
+      pageMode = "idle";
+      presenceData = null;
+      playbackData = null;
+      browseStart = null;
+      lastActivityKey = null;
+      lastSentPlayback = null;
+      armSessionKeepalive();
+      persistPresenceState();
+      // Don't await inside hydrate — clearPresence→hydrate deadlocked the popup.
+      clearPresence().catch((err) => console.warn("restore clearPresence:", err));
+      return;
+    }
+  }
+
+  if (pageMode !== "idle" && isSharingActive()) {
+    if (pageMode === "watch")
+      watchNavAllowTitleOnly = true;
     armSessionKeepalive();
-    await clearPresence();
-    persistPresenceState();
+    // One shot — do not bypassGap here (that arms backup alarms and storms).
+    flushPresence({ urgent: true });
   }
 }
 
@@ -1614,7 +1994,7 @@ async function ensureMiruroTabAlive() {
   return false;
 }
 
-async function onActiveTabGone(tabId) {
+async function onActiveTabGone(tabId, { keepalive = false } = {}) {
   if (activeTabId != null && tabId !== activeTabId)
     return;
   const next = await findMiruroTab();
@@ -1625,7 +2005,7 @@ async function onActiveTabGone(tabId) {
     // Other tab's content script will claim/browse/watch shortly.
     return;
   }
-  await clearPresenceState();
+  await clearPresenceState({ keepalive });
 }
 
 async function clearPresenceState({ keepalive = false } = {}) {
@@ -1664,14 +2044,15 @@ async function onClear(tabId) {
 async function onLeave(tabId, reason = "") {
   if (tabId != null && activeTabId != null && tabId !== activeTabId)
     return { ok: true };
-  // Android minimize / app switch — clear Discord with keepalive so the
-  // request can finish after Firefox backgrounds the page.
+  // Tab close / navigate away — keepalive so the delete can finish after the
+  // content script dies (SW would otherwise drop a normal fetch).
   if (reason === "hidden" || reason === "pagehide" || reason === "freeze") {
     await clearPresenceState({ keepalive: true });
     return { ok: true };
   }
-  if (tabId == null || activeTabId == null || tabId === activeTabId)
-    await onActiveTabGone(tabId ?? activeTabId);
+  if (tabId == null || activeTabId == null || tabId === activeTabId) {
+    await onActiveTabGone(tabId ?? activeTabId, { keepalive: true });
+  }
   return { ok: true };
 }
 
@@ -1702,10 +2083,26 @@ function scheduleRateLimitRetry() {
   }, delay);
 }
 
-function flushPresence({ urgent = false } = {}) {
+function flushPresence({ urgent = false, bypassGap = false } = {}) {
   if (Date.now() < rateLimitUntil) {
     pushQueued = true;
     scheduleRateLimitRetry();
+    return;
+  }
+
+  // Idle→browse / mode change: POST now. One delayed alarm is backup only
+  // (cold SW may drop the in-flight promise) — never re-arm on every urgent.
+  if (urgent && bypassGap) {
+    if (flushDebounceTimer) {
+      clearTimeout(flushDebounceTimer);
+      flushDebounceTimer = null;
+    }
+    armPresenceFlushAlarm(2000);
+    if (pushInFlight) {
+      pushQueued = true;
+      return;
+    }
+    pushPresence().catch((err) => console.warn("pushPresence:", err));
     return;
   }
 
@@ -1728,13 +2125,15 @@ function flushPresence({ urgent = false } = {}) {
       return;
     }
     // Space POSTs out — Discord 429s hard if we burst.
+    // Mode changes (browse→watch) may bypass the long gap with a tiny floor.
     const gap = Date.now() - lastPushAt;
-    if (lastPushAt && gap < MIN_POST_GAP_MS) {
+    const minGap = bypassGap ? 900 : MIN_POST_GAP_MS;
+    if (lastPushAt && gap < minGap) {
       pushQueued = true;
       flushDebounceTimer = setTimeout(() => {
         flushDebounceTimer = null;
-        flushPresence({ urgent: true });
-      }, MIN_POST_GAP_MS - gap);
+        flushPresence({ urgent: true, bypassGap });
+      }, minGap - gap);
       return;
     }
     pushPresence().catch((err) => console.warn("pushPresence:", err));
@@ -1751,6 +2150,9 @@ async function pushPresence({ keepalive = false } = {}) {
     return;
   // Don't let keepalive stamp frozen 00:00 while a tab/anime switch is settling.
   if (keepalive && watchAwaitingPlayback)
+    return;
+  // After Clear stuck RPC — don't let a live Miruro tab instantly rebuild browse.
+  if (Date.now() < presenceSuppressedUntil)
     return;
 
   // Master off / muted anime — keep Discord clear and skip POSTs.
@@ -1793,12 +2195,19 @@ async function pushPresence({ keepalive = false } = {}) {
     if (!accessToken) {
       logDiscord(false, playbackData, { error: "no token" });
       setBadge("auth");
+      // Auth was still loading — retry once the worker stays awake.
+      if (pageMode === "watch")
+        armWatchFlushAlarm(1200);
+      else if (pageMode === "browse")
+        armPresenceFlushAlarm(1200);
       return;
     }
 
     const android = await isAndroidRuntime();
-    const snapMode = pageMode;
+    let snapMode = pageMode;
     const snapPresence = presenceData;
+    if (snapMode === "browse" && snapPresence?.title)
+      snapMode = "watch";
     // Use the YOU-action snapshot so a delayed POST can't turn "pause" into
     // "playing" because the player moved on while we waited for rate/gap.
     // Nav fallback is title-only. Prefer live media when the first watch flush
@@ -1808,13 +2217,11 @@ async function pushPresence({ keepalive = false } = {}) {
       if (
         snapMode === "watch" &&
         hasValidPlayback(playbackData) &&
-        (MEDIA_SOURCE_RANK[String(playbackData.source || "")] ?? 0) >= 2 &&
+        isTrustedMedia(playbackData) &&
         Date.now() >= playbackMuteUntil
       ) {
         snapPlayback = playbackSnapshot(playbackData);
-      } else if (watchNavAllowTitleOnly || android) {
-        // Phone: don't stall forever, but keep any media we already have so
-        // Discord gets a real progress bar (not frozen 00:00).
+      } else if (watchNavAllowTitleOnly || android || snapMode === "watch") {
         if (hasValidPlayback(playbackData))
           snapPlayback = playbackSnapshot(playbackData);
         else
@@ -1834,8 +2241,24 @@ async function pushPresence({ keepalive = false } = {}) {
     watchNavAllowTitleOnly = false;
 
     if (snapMode === "idle") {
-      await clearPresence({ keepalive: android });
-      logDiscord(true, null, { shown: "cleared", ms: 0 });
+      // Stale queued flush after browse/watch already left — don't attribute
+      // this to the old YOU nav line.
+      pendingUserAction = null;
+      if (!sessionToken && !sessionTokenHistory.length)
+        return;
+      const cleared = await clearPresence({ keepalive: android });
+      logDiscord(cleared, null, {
+        shown: cleared ? "cleared" : "clear failed",
+        ms: 0,
+        forAction: null
+      });
+      return;
+    }
+
+    // Browse prep lost the race to watch — send watch on the follow-up instead.
+    if (snapMode === "browse" && pageMode === "watch") {
+      pushQueued = true;
+      lastActivityKey = null;
       return;
     }
 
@@ -1851,8 +2274,7 @@ async function pushPresence({ keepalive = false } = {}) {
         platform: "desktop",
         supported_platforms: ["desktop", "android", "ios"],
         assets: {
-          large_image: ACTIVITY.assetUrl || ACTIVITY.assetId,
-          large_text: ACTIVITY.browseName
+          large_image: ACTIVITY.assetUrl || ACTIVITY.assetId
         },
         timestamps: { start: String(browseStart) }
       };
@@ -1863,13 +2285,14 @@ async function pushPresence({ keepalive = false } = {}) {
         return;
     }
 
-    const key = activityKey(activity);
+    const key = activityKey(activity, snapPlayback);
     if (key === lastActivityKey)
       return;
 
     const startedAt = Date.now();
     const actionIdAtStart = pendingUserAction?.id ?? null;
     const actionAtStart = pendingUserAction?.action || null;
+    const modeAtStart = snapMode;
 
     try {
       let result;
@@ -1877,7 +2300,7 @@ async function pushPresence({ keepalive = false } = {}) {
         result = await upsertHeadlessSession(accessToken, activity, sessionToken);
       } catch (err) {
         // Watch payloads with cover/buttons sometimes 400 — retry minimal, same token.
-        if (snapMode === "watch" && sessionToken) {
+        if (modeAtStart === "watch" && sessionToken) {
           const minimal = buildMinimalWatchActivity(snapPresence, snapPlayback);
           if (!minimal)
             throw err;
@@ -1888,15 +2311,31 @@ async function pushPresence({ keepalive = false } = {}) {
         }
       }
       if (result?.token)
-        sessionToken = result.token;
-      // Await persist — Android may kill us before a fire-and-forget write lands.
-      await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: sessionToken });
-      if (snapMode === "watch")
+        await rememberSessionToken(result.token);
+      else if (sessionToken)
+        await rememberSessionToken(sessionToken);
+
+      // Left Miruro while this POST was in flight — delete what we just upserted.
+      if (pageMode === "idle") {
+        await forceClearHeadlessPresence(accessToken, { keepalive: android });
+        return;
+      }
+      // Browse finished after watch started — queue a watch follow-up.
+      if (modeAtStart === "browse" && pageMode === "watch") {
+        pushQueued = true;
+        lastActivityKey = null;
+        return;
+      }
+
+      if (modeAtStart === "watch")
         clearWatchFlushAlarm();
 
       lastActivityKey = key;
       lastPushAt = Date.now();
-      if (snapMode === "watch" && snapPlayback && snapPlayback.duration > 0) {
+      try {
+        chrome.alarms.clear(ALARM_PRESENCE_FLUSH);
+      } catch { /* ignore */ }
+      if (modeAtStart === "watch" && snapPlayback && snapPlayback.duration > 0) {
         lastSentPlayback = {
           currentTime: snapPlayback.currentTime,
           duration: snapPlayback.duration,
@@ -1906,14 +2345,14 @@ async function pushPresence({ keepalive = false } = {}) {
         watchAwaitingPlayback = false;
         watchPlaybackFlushQueued = false;
         clearWatchPlaybackTimers();
-      } else if (snapMode === "watch" && pendingUserAction?.kind === "nav") {
+      } else if (modeAtStart === "watch" && pendingUserAction?.kind === "nav") {
         // Title-only fallback — stop waiting so later ticks can update normally.
         watchAwaitingPlayback = false;
         watchPlaybackFlushQueued = false;
       }
       setPushError(null);
       persistPresenceState();
-      setBadge(snapMode === "watch" ? "watch" : "browse");
+      setBadge(modeAtStart === "watch" ? "watch" : "browse");
 
       // If pause→play (or another YOU) landed mid-POST, keep pending and requeue.
       const newerAction =
@@ -1921,7 +2360,7 @@ async function pushPresence({ keepalive = false } = {}) {
 
       if (keepalive && !pendingUserAction) {
         // silent session keepalive
-      } else if (snapMode === "browse") {
+      } else if (modeAtStart === "browse") {
         logDiscord(true, null, {
           shown: "browse",
           ms: Date.now() - startedAt,
@@ -1932,7 +2371,7 @@ async function pushPresence({ keepalive = false } = {}) {
         const snap = formatPlaybackShort(snapPlayback);
         const shown = snap
           ? `${snap.paused ? "paused" : "playing"} @ ${snap.at}`
-          : `watch ${String(snapPresence?.title || "").slice(0, 32)}`;
+          : `watch ${String(activity?.name || snapPresence?.title || "").slice(0, 40)}`;
         logDiscord(true, snapPlayback, {
           shown,
           ms: Date.now() - startedAt,
@@ -1953,10 +2392,8 @@ async function pushPresence({ keepalive = false } = {}) {
       if (/rate limit/i.test(msg)) {
         rateLimitUntil = Date.now() + 15000;
         pushQueued = true;
-        // Don't keep a stale "for pause @ 3:45" across the wait — next POST
-        // will describe whatever state is current then.
-        if (pendingUserAction && Date.now() - pendingUserAction.t > 500)
-          pendingUserAction = null;
+        // Keep pause/seek pending across the backoff — dropping them left Discord
+        // stuck on "playing" after the user already paused.
         setPushError(msg);
         scheduleRateLimitRetry();
         return;
@@ -1968,7 +2405,7 @@ async function pushPresence({ keepalive = false } = {}) {
     pushInFlight = false;
     if (pushQueued && Date.now() >= rateLimitUntil) {
       pushQueued = false;
-      lastActivityKey = null;
+      // Keep lastActivityKey — duplicate playing ticks must not force another POST.
       setTimeout(() => flushPresence({ urgent: true }), MIN_POST_GAP_MS);
     }
   }
@@ -1981,6 +2418,325 @@ async function pushTestPresence() {
   browseStart = Date.now();
   lastActivityKey = null;
   await pushPresence();
+}
+
+function nameTitleMax() {
+  return Number(ACTIVITY.nameTitleMax) > 0 ? Number(ACTIVITY.nameTitleMax) : 16;
+}
+
+function heuristicTitleVariants(title) {
+  const full = sanitizePresenceText(title, 128);
+  if (!full)
+    return [];
+  const out = [full];
+  const noSeason = full
+    .replace(/\s*[:\-–—]?\s*(?:season|part|cour|arc|series)\s*\d+\b.*$/i, "")
+    .replace(/\s+\d+(?:st|nd|rd|th)?\s+season\b.*$/i, "")
+    .trim();
+  if (noSeason && noSeason !== full)
+    out.push(noSeason);
+  for (const base of [...out]) {
+    const colon = base.indexOf(":");
+    if (colon > 2) {
+      const left = base.slice(0, colon).trim();
+      if (left.length >= 3)
+        out.push(left);
+    }
+    // TSUKIMICHI -Moonlit Fantasy- → TSUKIMICHI
+    const dash = base.split(/\s[-–—]\s+|\s[-–—]|[-–—]\s+/)[0].trim()
+      .replace(/^[-–—]+|[-–—]+$/g, "")
+      .trim();
+    if (dash.length >= 3 && dash.length < base.length)
+      out.push(dash);
+  }
+  return out;
+}
+
+function latinRatio(text) {
+  const chars = String(text || "").replace(/\s+/g, "");
+  if (!chars)
+    return 0;
+  let latin = 0;
+  for (const ch of chars) {
+    if (/[A-Za-z0-9]/.test(ch))
+      latin += 1;
+  }
+  return latin / chars.length;
+}
+
+function isWeakShortTitle(text, fullTitle) {
+  const value = sanitizePresenceText(text, 128);
+  if (!value || value.length < 2)
+    return true;
+  if (/^(season|part|cour|arc|movie|ova|ona|special)s?\b/i.test(value))
+    return true;
+  if (value.length > 24 && /[,!]/.test(value) && value.length >= String(fullTitle || "").length)
+    return true;
+  return false;
+}
+
+function scoreShortTitleCandidate(text, fullTitle, max) {
+  const value = sanitizePresenceText(text, 128);
+  if (isWeakShortTitle(value, fullTitle))
+    return Number.POSITIVE_INFINITY;
+  const over = Math.max(0, value.length - max);
+  const latin = latinRatio(value);
+  return (
+    over * 1000 +
+    value.length * 10 +
+    // Discord name should stay Latin when possible (native JP is short but unreadable in the ladder).
+    (latin < 0.55 ? 5000 : 0) +
+    // "That Time I Got" must lose to TenSura.
+    (isAwkwardEnglishTrunc(value) ? 8000 : 0) +
+    (value.includes(",") ? 40 : 0) +
+    (value.split(/\s+/).length > 4 ? 25 : 0)
+  );
+}
+
+function isLatinShortTitle(text) {
+  return latinRatio(text) >= 0.55;
+}
+
+function truncateLatinTitle(text, max) {
+  const value = sanitizePresenceText(text, 128);
+  if (!value || !isLatinShortTitle(value))
+    return "";
+  if (value.length <= max)
+    return value;
+  return value.slice(0, max).replace(/\s+\S*$/, "").trim()
+    || value.slice(0, max).trim();
+}
+
+/** "That Time I Got" is a bad cut; "My Gift Lvl 9999" is fine. */
+function isAwkwardEnglishTrunc(trunc) {
+  const value = sanitizePresenceText(trunc, 128);
+  if (!value || value.length < 6)
+    return true;
+  return /\b(i|a|an|the|as|of|and|or|to|got|my|for|in|on|at)$/i.test(value);
+}
+
+/** Short label for Discord `name` only — full title stays in `details`. */
+function shortTitleForWatchName(fullTitle, extraTitles = []) {
+  const full = sanitizePresenceText(fullTitle, 128);
+  if (!full)
+    return "";
+  const max = nameTitleMax();
+  const localVariants = heuristicTitleVariants(full)
+    .map((t) => sanitizePresenceText(t, 128))
+    .filter((t) => t && !isWeakShortTitle(t, full));
+  const localLatinFit = localVariants
+    .filter((t) => t.length <= max && isLatinShortTitle(t) && !isAwkwardEnglishTrunc(t))
+    .sort((a, b) => b.length - a.length || a.localeCompare(b))[0];
+  if (localLatinFit)
+    return localLatinFit;
+
+  const pool = [];
+  const seen = new Set();
+  const push = (value) => {
+    for (const variant of heuristicTitleVariants(value)) {
+      const clean = sanitizePresenceText(variant, 128);
+      const key = normalizeTitleKey(clean);
+      if (!clean || !key || seen.has(key))
+        continue;
+      seen.add(key);
+      pool.push(clean);
+    }
+  };
+  push(full);
+  for (const alt of extraTitles || [])
+    push(alt);
+  if (!pool.length)
+    return truncateLatinTitle(full, max) || "";
+
+  const latinPool = pool.filter(isLatinShortTitle);
+  const usePool = latinPool.length ? latinPool : pool;
+  usePool.sort(
+    (a, b) =>
+      scoreShortTitleCandidate(a, full, max) - scoreShortTitleCandidate(b, full, max)
+  );
+  // Prefer real shorts (TenSura, Mugen Gacha) over awkward English cuts.
+  const nonAwkwardFit = usePool.find(
+    (t) => t.length <= max && !isAwkwardEnglishTrunc(t)
+  );
+  if (nonAwkwardFit)
+    return nonAwkwardFit;
+
+  // AniList not in yet — last resort truncation.
+  const scrapedTrunc = truncateLatinTitle(
+    localVariants.filter(isLatinShortTitle).sort((a, b) => a.length - b.length)[0] || full,
+    max
+  );
+  if (scrapedTrunc)
+    return scrapedTrunc;
+  const truncSource = usePool[0];
+  if (!truncSource)
+    return "";
+  return truncSource.slice(0, max).replace(/\s+\S*$/, "").trim()
+    || truncSource.slice(0, max).trim();
+}
+
+function collectPresenceTitleAlts(presence) {
+  const out = [];
+  if (Array.isArray(presence?.titles))
+    out.push(...presence.titles);
+  if (Array.isArray(presence?.anilistTitles))
+    out.push(...presence.anilistTitles);
+  return out;
+}
+
+function buildWatchActivityName(fullTitle, presence = null) {
+  const short = shortTitleForWatchName(fullTitle, collectPresenceTitleAlts(presence));
+  const suffix = ACTIVITY.watchNameSuffix || " on Miruro! ッ";
+  if (!short)
+    return ACTIVITY.watchName || `Anime${suffix}`;
+  return sanitizePresenceText(`${short}${suffix}`, 128);
+}
+
+const anilistTitleCache = new Map();
+const anilistInflight = new Map();
+
+function parseAnilistIdFromCover(url) {
+  const value = String(url || "");
+  let m = value.match(
+    /\/media\/anime\/cover\/(?:extraLarge|large|medium)\/(?:[a-z]{1,3})?(\d{2,7})-/i
+  );
+  if (m)
+    return Number(m[1]);
+  m = value.match(/img\.anili\.st\/media\/(\d{2,7})/i);
+  if (m)
+    return Number(m[1]);
+  m = value.match(/anilist\.co\/(?:anime|manga)\/(\d{2,7})/i);
+  return m ? Number(m[1]) : null;
+}
+
+async function fetchAnilistTitles({ id = null, search = "" } = {}) {
+  const cacheKey = id ? `id:${id}` : `q:${normalizeTitleKey(search)}`;
+  if (!id && !String(search || "").trim())
+    return [];
+  if (anilistTitleCache.has(cacheKey))
+    return anilistTitleCache.get(cacheKey) || [];
+  if (anilistInflight.has(cacheKey))
+    return anilistInflight.get(cacheKey);
+
+  const request = (async () => {
+    const query = id
+      ? `query ($id: Int) {
+          Media(id: $id, type: ANIME) {
+            title { romaji english native }
+            synonyms
+          }
+        }`
+      : `query ($q: String) {
+          Media(search: $q, type: ANIME) {
+            title { romaji english native }
+            synonyms
+          }
+        }`;
+    try {
+      const res = await fetch("https://graphql.anilist.co", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        body: JSON.stringify({
+          query,
+          variables: id ? { id: Number(id) } : { q: String(search).slice(0, 100) }
+        })
+      });
+      if (!res.ok)
+        throw new Error(`AniList ${res.status}`);
+      const json = await res.json();
+      const media = json?.data?.Media;
+      if (!media) {
+        anilistTitleCache.set(cacheKey, []);
+        return [];
+      }
+      const titles = [
+        media.title?.english,
+        media.title?.romaji,
+        media.title?.native,
+        ...(Array.isArray(media.synonyms) ? media.synonyms : [])
+      ]
+        .map((t) => sanitizePresenceText(t, 128))
+        .filter(Boolean);
+      anilistTitleCache.set(cacheKey, titles);
+      return titles;
+    } catch {
+      return [];
+    } finally {
+      anilistInflight.delete(cacheKey);
+    }
+  })();
+
+  anilistInflight.set(cacheKey, request);
+  return request;
+}
+
+function anilistTitlesMatchScraped(scrapedTitle, anilistTitles) {
+  const scraped = normalizeTitleKey(scrapedTitle);
+  if (!scraped || !Array.isArray(anilistTitles) || !anilistTitles.length)
+    return false;
+  const scrapedWords = scraped.split(/[^a-z0-9]+/).filter((w) => w.length > 2);
+  for (const raw of anilistTitles) {
+    const key = normalizeTitleKey(raw);
+    if (!key)
+      continue;
+    if (key === scraped || key.includes(scraped) || scraped.includes(key))
+      return true;
+    if (!scrapedWords.length)
+      continue;
+    const other = new Set(key.split(/[^a-z0-9]+/).filter((w) => w.length > 2));
+    const hits = scrapedWords.filter((w) => other.has(w)).length;
+    if (hits / scrapedWords.length >= 0.5)
+      return true;
+  }
+  return false;
+}
+
+async function resolveAnilistTitles(presence) {
+  const scraped = String(presence?.title || "").trim();
+  if (!scraped)
+    return [];
+  const searched = await fetchAnilistTitles({ search: scraped });
+  if (searched.length && anilistTitlesMatchScraped(scraped, searched))
+    return searched;
+  const id = Number(presence.anilistId) || parseAnilistIdFromCover(presence.cover) || null;
+  if (!id)
+    return searched;
+  const byId = await fetchAnilistTitles({ id });
+  if (byId.length && anilistTitlesMatchScraped(scraped, byId))
+    return byId;
+  return searched;
+}
+
+async function enrichWatchTitlesFromAnilist(presence, { flush = true } = {}) {
+  if (!presence?.title)
+    return false;
+  if (Array.isArray(presence.anilistTitles) && presence.anilistTitles.length)
+    return false;
+  const titles = await resolveAnilistTitles(presence);
+  if (!titles.length || !anilistTitlesMatchScraped(presence.title, titles))
+    return false;
+  if (presenceData !== presence && presenceMetaKey(presenceData) !== presenceMetaKey(presence))
+    return false;
+  const before = buildWatchActivityName(presence.title, presence);
+  presence.anilistTitles = titles;
+  if (presenceData === presence || presenceMetaKey(presenceData) === presenceMetaKey(presence)) {
+    if (presenceData && presenceData !== presence)
+      presenceData.anilistTitles = titles;
+    else if (!presenceData)
+      presenceData = presence;
+  }
+  const after = buildWatchActivityName(presence.title, presence);
+  if (before === after)
+    return false;
+  persistPresenceState();
+  if (flush) {
+    lastActivityKey = null;
+    flushPresence({ urgent: true });
+  }
+  return true;
 }
 
 function buildWatchActivity(presence, playback) {
@@ -2013,7 +2769,7 @@ function buildWatchActivity(presence, playback) {
   // (timestamps are millisecond strings, not IPC-style seconds).
   const activity = {
     type: 3,
-    name: ACTIVITY.watchName,
+    name: buildWatchActivityName(details, presence),
     details,
     state,
     application_id: CLIENT_ID,
@@ -2110,19 +2866,40 @@ function sanitizeWatchUrl(url) {
   }
 }
 
-function activityKey(activity) {
+function activityKey(activity, playback = null) {
+  // Do NOT key on wall-clock timestamp strings — those change every Date.now()
+  // and were re-POSTing identical "playing @ 0:01" every few seconds → 429 →
+  // pause never landed.
+  let progress = "none";
+  if (hasValidPlayback(playback)) {
+    const t = Math.floor(Number(playback.currentTime) || 0);
+    progress = playback.paused ? `paused:${t}` : `play:${t}`;
+  } else {
+    const start = Number(activity?.timestamps?.start);
+    const end = Number(activity?.timestamps?.end);
+    if (Number.isFinite(start) && Number.isFinite(end))
+      progress = end <= start ? "paused" : "play";
+  }
   return JSON.stringify({
-    details: activity.details,
-    state: activity.state,
-    type: activity.type,
-    image: activity.assets?.large_image,
-    small: activity.assets?.small_image,
-    start: activity.timestamps?.start ?? null,
-    end: activity.timestamps?.end ?? null
+    name: activity?.name,
+    details: activity?.details,
+    state: activity?.state,
+    type: activity?.type,
+    image: activity?.assets?.large_image,
+    small: activity?.assets?.small_image,
+    progress
   });
 }
 
-async function upsertHeadlessSession(accessToken, activity, token) {
+function isInvalidAuthMessage(msg, status) {
+  if (status === 401)
+    return true;
+  return /invalid (oauth2 )?access token|invalid authentication token|unauthorized/i.test(
+    String(msg || "")
+  );
+}
+
+async function upsertHeadlessSession(accessToken, activity, token, { retriedAuth = false } = {}) {
   const body = { activities: [activity] };
   if (token)
     body.token = token;
@@ -2144,17 +2921,56 @@ async function upsertHeadlessSession(accessToken, activity, token) {
       rateLimitUntil = Date.now() + Math.max(10, retry) * 1000;
       throw new Error("You are being rate limited.");
     }
-    // 404 only: token is dead — safe to open a replacement session.
-    // 400 is often a bad activity payload; retrying without the token orphans
-    // the live browse session (stuck "Looking for peak").
-    if (token && res.status === 404) {
+    // Stale headless session id — try delete first (may still be live), then create.
+    // Creating without deleting stacks a second session; Discord shows the newest
+    // until you delete it, then the orphan comes back.
+    if (
+      token &&
+      (res.status === 404 ||
+        /invalid.*session|unknown.*session|invalid authentication token/i.test(msg))
+    ) {
+      sessionTokenHistory = normalizeTokenHistory(sessionTokenHistory, token);
+      try {
+        await deleteHeadlessSession(accessToken, token);
+      } catch (err) {
+        console.warn("upsert stale-token delete:", err);
+      }
       sessionToken = null;
       try {
-        await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: null });
+        await chrome.storage.local.set({
+          [STORAGE_KEYS.sessionToken]: null,
+          [STORAGE_KEYS.sessionTokenHistory]: sessionTokenHistory
+        });
       } catch { /* ignore */ }
-      return upsertHeadlessSession(accessToken, activity, null);
+      return upsertHeadlessSession(accessToken, activity, null, { retriedAuth });
     }
+    if (!retriedAuth && isInvalidAuthMessage(msg, res.status)) {
+      try {
+        const fresh = await refreshTokens();
+        return upsertHeadlessSession(fresh, activity, null, { retriedAuth: true });
+      } catch {
+        throw new Error("Discord login expired — Disconnect and Connect Discord again.");
+      }
+    }
+    if (isInvalidAuthMessage(msg, res.status))
+      throw new Error("Discord login expired — Disconnect and Connect Discord again.");
     throw new Error(msg);
+  }
+
+  // Created a brand-new session — delete any older tokens we still know about
+  // so they can't resurface after this one is cleared.
+  if (!token && json?.token) {
+    const stale = normalizeTokenHistory(sessionTokenHistory).filter((t) => t !== json.token);
+    if (stale.length) {
+      Promise.allSettled(
+        stale.map((t) => deleteHeadlessSession(accessToken, t).catch(() => {}))
+      ).then(() => {
+        sessionTokenHistory = normalizeTokenHistory([json.token]);
+        chrome.storage.local.set({
+          [STORAGE_KEYS.sessionTokenHistory]: sessionTokenHistory
+        }).catch(() => {});
+      });
+    }
   }
 
   return json;
@@ -2188,7 +3004,7 @@ function buildMinimalWatchActivity(presence, playback = null) {
   }
   return {
     type: 3,
-    name: ACTIVITY.watchName,
+    name: buildWatchActivityName(details, presence),
     details,
     state,
     application_id: CLIENT_ID,
@@ -2215,77 +3031,133 @@ async function deleteHeadlessSession(accessToken, token, { keepalive = false } =
   // 204 success; 404 already gone — both fine. Anything else must retry.
   if (res.ok || res.status === 404)
     return true;
+  if (res.status === 429) {
+    const retry = Number(res.headers.get("Retry-After")) || 10;
+    rateLimitUntil = Math.max(rateLimitUntil, Date.now() + Math.max(10, retry) * 1000);
+    throw new Error("You are being rate limited.");
+  }
   const json = await res.json().catch(() => ({}));
   throw new Error(json.message || json.error || `Clear presence failed (${res.status})`);
+}
+
+/** Delete every remembered headless token. No reclaim — that only stacks cover sessions. */
+async function forceClearHeadlessPresence(
+  accessToken,
+  { keepalive = false, requireToken = false } = {}
+) {
+  if (!accessToken)
+    return { ok: false, deleted: 0, error: "not logged in" };
+
+  try {
+    const stored = await chrome.storage.local.get([
+      STORAGE_KEYS.sessionToken,
+      STORAGE_KEYS.sessionTokenHistory
+    ]);
+    if (!sessionToken && stored[STORAGE_KEYS.sessionToken])
+      sessionToken = stored[STORAGE_KEYS.sessionToken];
+    sessionTokenHistory = normalizeTokenHistory(
+      [
+        ...(Array.isArray(stored[STORAGE_KEYS.sessionTokenHistory])
+          ? stored[STORAGE_KEYS.sessionTokenHistory]
+          : []),
+        ...sessionTokenHistory
+      ],
+      sessionToken
+    );
+  } catch { /* ignore */ }
+
+  const tokensToDelete = normalizeTokenHistory(sessionTokenHistory, sessionToken);
+  lastActivityKey = null;
+
+  if (!tokensToDelete.length) {
+    if (!requireToken)
+      return { ok: true, deleted: 0, error: null };
+    return {
+      ok: false,
+      deleted: 0,
+      orphan: true,
+      error: "Token lost — Discord drops the orphan in ~20 min."
+    };
+  }
+
+  const survivors = [];
+  let deleted = 0;
+  for (const token of tokensToDelete) {
+    try {
+      await deleteHeadlessSession(accessToken, token, { keepalive });
+      deleted += 1;
+    } catch (err) {
+      console.warn("forceClear delete:", err);
+      survivors.push(token);
+    }
+  }
+
+  if (survivors.length) {
+    sessionToken = survivors[survivors.length - 1] || null;
+    sessionTokenHistory = survivors;
+    try {
+      await chrome.storage.local.set({
+        [STORAGE_KEYS.sessionToken]: sessionToken,
+        [STORAGE_KEYS.sessionTokenHistory]: sessionTokenHistory
+      });
+    } catch { /* ignore */ }
+    return { ok: false, deleted, error: "Couldn't delete all Discord sessions" };
+  }
+
+  await clearStoredSessionTokens();
+  return { ok: true, deleted, error: null };
 }
 
 /** Best-effort clear during browser quit — keepalive so the request can outlive the SW. */
 async function clearPresenceKeepalive() {
   let accessToken = tokens?.access_token || null;
-  let token = sessionToken;
   try {
     const stored = await chrome.storage.local.get([
       STORAGE_KEYS.sessionToken,
+      STORAGE_KEYS.sessionTokenHistory,
       STORAGE_KEYS.tokens
     ]);
-    token = token || stored[STORAGE_KEYS.sessionToken] || null;
+    if (!sessionToken)
+      sessionToken = stored[STORAGE_KEYS.sessionToken] || null;
+    sessionTokenHistory = normalizeTokenHistory(
+      stored[STORAGE_KEYS.sessionTokenHistory],
+      sessionToken
+    );
     if (!accessToken)
       accessToken = stored[STORAGE_KEYS.tokens]?.access_token || null;
   } catch { /* ignore */ }
-  if (!accessToken || !token)
+  if (!accessToken)
     return;
 
-  // Delete on Discord FIRST. Wiping the token before the request finishes is
-  // how Android force-stop left "Looking for peak" stuck with no way to clear.
-  try {
-    await deleteHeadlessSession(accessToken, token, { keepalive: true });
-  } catch (err) {
-    console.warn("clearPresenceKeepalive:", err);
-    return;
-  }
-
-  sessionToken = null;
-  lastActivityKey = null;
+  await forceClearHeadlessPresence(accessToken, { keepalive: true });
   pageMode = "idle";
   presenceData = null;
   playbackData = null;
   activeTabId = null;
   try {
     chrome.storage.local.set({
-      [STORAGE_KEYS.sessionToken]: null,
       [STORAGE_KEYS.presenceState]: null
     });
   } catch { /* ignore */ }
 }
 
 async function clearPresence({ allowRetry = true, keepalive = false } = {}) {
-  await hydrate();
-  const stored = await chrome.storage.local.get(STORAGE_KEYS.sessionToken);
-  const token = sessionToken || stored[STORAGE_KEYS.sessionToken] || null;
-  if (token)
-    sessionToken = token;
+  // Only hydrate when auth isn't already in memory (nested during restore).
+  if (!tokens?.access_token)
+    await hydrate({ restore: false });
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.sessionToken,
+    STORAGE_KEYS.sessionTokenHistory
+  ]);
+  if (!sessionToken && stored[STORAGE_KEYS.sessionToken])
+    sessionToken = stored[STORAGE_KEYS.sessionToken];
+  sessionTokenHistory = normalizeTokenHistory(
+    stored[STORAGE_KEYS.sessionTokenHistory],
+    sessionToken
+  );
 
-  const accessToken = await ensureAccessToken();
-  if (accessToken && token) {
-    try {
-      await deleteHeadlessSession(accessToken, token, { keepalive });
-    } catch (err) {
-      console.warn("clearPresence:", err);
-      // Keep the token — discarding it leaves Discord stuck on the old activity.
-      sessionToken = token;
-      await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: token });
-      setPushError(String(err?.message || err));
-      if (allowRetry) {
-        try {
-          chrome.alarms.create(ALARM_CLEAR_RETRY, { when: Date.now() + 5000 });
-        } catch {
-          chrome.alarms.create(ALARM_CLEAR_RETRY, { delayInMinutes: 0.1 });
-        }
-      }
-      return false;
-    }
-  } else if (token && !accessToken) {
-    // Can't talk to Discord yet — don't throw away the only delete key.
+  const accessToken = tokens?.access_token || (await ensureAccessToken());
+  if (!accessToken) {
     setPushError("Couldn't clear Discord presence (not authorized)");
     if (allowRetry) {
       try {
@@ -2297,12 +3169,23 @@ async function clearPresence({ allowRetry = true, keepalive = false } = {}) {
     return false;
   }
 
-  sessionToken = null;
-  lastActivityKey = null;
+  const result = await forceClearHeadlessPresence(accessToken, { keepalive });
+  const ok = Boolean(result?.ok);
+  if (!ok) {
+    setPushError(result?.error || "Couldn't clear Discord presence");
+    if (allowRetry) {
+      try {
+        chrome.alarms.create(ALARM_CLEAR_RETRY, { when: Date.now() + 5000 });
+      } catch {
+        chrome.alarms.create(ALARM_CLEAR_RETRY, { delayInMinutes: 0.1 });
+      }
+    }
+    return false;
+  }
+
   try {
     chrome.alarms.clear(ALARM_CLEAR_RETRY);
   } catch { /* ignore */ }
-  await chrome.storage.local.set({ [STORAGE_KEYS.sessionToken]: null });
   setPushError(null);
   if (!tokens?.access_token)
     setBadge("off");
@@ -2316,10 +3199,25 @@ async function clearPresence({ allowRetry = true, keepalive = false } = {}) {
 }
 
 async function clearStaleSessionIfNoMiruro() {
-  if (!sessionToken)
-    return;
   if (await findMiruroTab())
     return;
+  // Don't burn Discord rate limit when we already have nothing to delete.
+  const stored = await chrome.storage.local.get([
+    STORAGE_KEYS.sessionToken,
+    STORAGE_KEYS.sessionTokenHistory
+  ]);
+  const known = normalizeTokenHistory(
+    stored[STORAGE_KEYS.sessionTokenHistory],
+    stored[STORAGE_KEYS.sessionToken] || sessionToken
+  );
+  if (!known.length) {
+    pageMode = "idle";
+    presenceData = null;
+    playbackData = null;
+    activeTabId = null;
+    persistPresenceState();
+    return;
+  }
   rpcLog("clearing stale Discord session (no Miruro tabs)");
   await clearPresence();
   pageMode = "idle";
@@ -2365,8 +3263,12 @@ hydrate().then(async () => {
   setBadge(tokens?.access_token ? (presenceEnabled ? "on" : "paused") : "off");
   armSessionKeepalive();
   warmAuth();
-  // Browser kill / crash often skips leave — drop leftover headless RPC on boot.
-  await clearStaleSessionIfNoMiruro();
+  // Defer stale clear — first Miruro claim often races this boot path.
+  try {
+    chrome.alarms.create(ALARM_CLEAR_STALE, { when: Date.now() + 2500 });
+  } catch {
+    chrome.alarms.create(ALARM_CLEAR_STALE, { delayInMinutes: 0.05 });
+  }
 
   // Android: background often dies during Discord authorize — finish if callback tab is open.
   try {

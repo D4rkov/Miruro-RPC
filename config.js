@@ -22,7 +22,15 @@ export const OAUTH_REDIRECT_URI =
   "https://d4rkov.github.io/miruro-rpc-oauth/callback.html";
 
 export const ACTIVITY = {
+  /** Fallback / browse-era label; watch `name` is built as `{shortTitle}{watchNameSuffix}`. */
   watchName: "Anime on Miruro! ッ",
+  watchNameSuffix: " on Miruro! ッ",
+  /**
+   * Max chars for the title part of Discord `name` (before the suffix).
+   * ~16 + " on Miruro! ッ" fits the server member list; `details` keeps the full title.
+   * Short labels come from page scrapes + AniList titles/synonyms (auto), not a manual map.
+   */
+  nameTitleMax: 16,
   browseName: "Searching for Anime! ッ",
   browseDetails: "Looking for peak",
   buttonLabel: "Watch on Miruro! ッ",

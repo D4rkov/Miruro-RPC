@@ -65,7 +65,7 @@ export const CLIENT_ID = "your-application-id";
 Watch: large = anime cover; small = play/pause icon. Browse: Miruro brand art.  
 Headless needs asset **IDs/CDN URLs** (not IPC name keys). See `config.js`.  
 Optional: upload play/pause art in the Discord portal, then set `ACTIVITY.playUrl` / `pauseUrl` in `config.js` to those `cdn.discordapp.com/app-assets/...` URLs (third-party image proxies are not used).  
-Top-frame scripts match **miruro.cx** only; player iframes no-op unless framed by Miruro.
+Top-frame scripts match **miruro.cx** only. Playback comes from `strmcx-embed` / in-page video — no site-wide iframe content script.
 
 ---
 

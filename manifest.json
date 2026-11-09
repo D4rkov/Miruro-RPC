@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Miruro RPC",
-  "version": "3.0.9",
+  "version": "3.0.11",
   "description": "Discord Rich Presence for Miruro via Social Layer (extension only).",
   "browser_specific_settings": {
     "gecko": {
@@ -46,6 +46,7 @@
   ],
   "host_permissions": [
     "https://discord.com/*",
+    "https://graphql.anilist.co/*",
     "https://miruro.cx/*",
     "https://www.miruro.cx/*",
     "https://*.miruro.cx/*",
@@ -67,12 +68,6 @@
       ],
       "js": ["content/oauth-callback.js"],
       "run_at": "document_start"
-    },
-    {
-      "matches": ["*://*/*"],
-      "js": ["content/embed.js"],
-      "all_frames": true,
-      "run_at": "document_idle"
     }
   ]
 }

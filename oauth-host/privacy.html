@@ -83,6 +83,7 @@
     <ul>
       <li>On Miruro pages, the extension may read page content such as anime title, episode number, episode title, cover image URL, watch page URL, and playback position.</li>
       <li>That information is used to build your Discord Rich Presence (and optional “hide this anime” / presence on-off settings stored locally).</li>
+      <li>When a title is long, the extension may look up alternate/short titles from <strong>AniList</strong> (using an AniList id from the cover/URL when available, otherwise a title search) so Discord’s member-list status can show a shorter name. The full title still appears in Rich Presence details.</li>
     </ul>
 
     <p><strong>Presence session</strong></p>
@@ -94,6 +95,7 @@
     <h2>Where data is sent</h2>
     <ul>
       <li><strong>Discord</strong> (<code>discord.com</code> API) — OAuth token exchange and Rich Presence updates.</li>
+      <li><strong>AniList</strong> (<code>graphql.anilist.co</code>) — optional title/synonym lookup for shorter Discord activity names.</li>
       <li><strong>OAuth callback page</strong> (<code>https://d4rkov.github.io/miruro-rpc-oauth/</code>) — used on Firefox for Android so Discord can redirect after login. The authorization code appears in the page URL briefly; the extension reads it locally to finish login. That page does not store your Discord password or tokens.</li>
     </ul>
     <p>

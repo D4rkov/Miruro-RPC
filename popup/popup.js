@@ -4,6 +4,7 @@ const loginBtn = document.getElementById("loginBtn");
 const logoutBtn = document.getElementById("logoutBtn");
 const sharingRow = document.getElementById("sharingRow");
 const togglePresenceBtn = document.getElementById("togglePresenceBtn");
+const forceClearBtn = document.getElementById("forceClearBtn");
 const muteRow = document.getElementById("muteRow");
 const muteTitleBtn = document.getElementById("muteTitleBtn");
 const sharingHint = document.getElementById("sharingHint");
@@ -163,8 +164,24 @@ function startDebugPoll() {
   debugTimer = setInterval(refreshDebug, 400);
 }
 
+function withTimeout(promise, ms, label) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label || `Timed out (${ms}ms)`)), ms);
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
 async function refresh() {
-  const status = await chrome.runtime.sendMessage({ type: "getStatus" });
+  const status = await withTimeout(
+    chrome.runtime.sendMessage({ type: "getStatus" }),
+    8000,
+    "Extension background stuck — reload the extension"
+  );
+  if (!status?.ok && status?.error)
+    throw new Error(status.error);
   setDevUi(status.isDevBuild === true);
   if (isDevBuild)
     redirectUriEl.textContent = status.redirectUri || "…";
@@ -289,6 +306,30 @@ logoutBtn.addEventListener("click", async () => {
   await refresh();
 });
 
+forceClearBtn.addEventListener("click", async () => {
+  forceClearBtn.disabled = true;
+  statusText.textContent = "Clearing Discord presence…";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "forceClearPresence" });
+    if (result?.ok) {
+      statusText.textContent = result.deleted
+        ? `Discord presence cleared (${result.deleted} session${result.deleted === 1 ? "" : "s"})`
+        : "Discord presence cleared";
+      statusText.dataset.state = "ok";
+    } else {
+      statusText.textContent =
+        result?.error || result?.lastPushError || "Clear failed";
+      statusText.dataset.state = "";
+    }
+  } catch (err) {
+    statusText.textContent = String(err?.message || err);
+    statusText.dataset.state = "";
+  } finally {
+    forceClearBtn.disabled = false;
+    await refresh();
+  }
+});
+
 togglePresenceBtn.addEventListener("click", async () => {
   togglePresenceBtn.disabled = true;
   try {
@@ -382,5 +423,8 @@ refresh()
       startDebugPoll();
   })
   .catch((err) => {
-    statusText.textContent = String(err.message || err);
+    statusText.textContent = String(err?.message || err);
+    statusText.dataset.state = "";
+    loginBtn.hidden = false;
+    loginBtn.disabled = false;
   });
