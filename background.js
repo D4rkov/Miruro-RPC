@@ -70,6 +70,8 @@ let seekPin = null;
 /** Prefer recent trusted media; strmcx is Miruro's primary player now. */
 let lastMediaSourceAt = 0;
 let lastMediaSource = "";
+/** Last time applyPlayback accepted trusted/live media (playing or pause). */
+let lastPlaybackMsgAt = 0;
 /** Debounce Discord POSTs so dual embed ticks coalesce. */
 let flushDebounceTimer = null;
 const FLUSH_DEBOUNCE_MS = 400;
@@ -308,6 +310,9 @@ const ALARM_WATCH_FLUSH = "watchPresenceFlush";
 const ALARM_PRESENCE_FLUSH = "presenceFlush";
 const ALARM_CLEAR_RETRY = "clearPresenceRetry";
 const ALARM_CLEAR_STALE = "clearStaleSession";
+/** Discord still "playing" but content ticks stopped — force paused presence. */
+const ALARM_PLAYBACK_STALL = "playbackStallPause";
+const PLAYBACK_STALL_MS = 4000;
 
 /** Serialize hydrates — cold SW often races boot hydrate vs first Miruro message. */
 let hydrateInFlight = null;
@@ -330,6 +335,11 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     // Only if nothing claimed Miruro during boot race.
     if (pageMode === "idle")
       await clearStaleSessionIfNoMiruro();
+    return;
+  }
+  if (alarm.name === ALARM_PLAYBACK_STALL) {
+    await hydrate({ force: true, restore: false });
+    maybeForceStallPause("alarm");
     return;
   }
   if (alarm.name === ALARM_PRESENCE_FLUSH || alarm.name === ALARM_WATCH_FLUSH) {
@@ -444,6 +454,68 @@ function clearWatchFlushAlarm() {
   try {
     chrome.alarms.clear(ALARM_WATCH_FLUSH);
   } catch { /* ignore */ }
+}
+
+function clearPlaybackStallAlarm() {
+  try {
+    chrome.alarms.clear(ALARM_PLAYBACK_STALL);
+  } catch { /* ignore */ }
+}
+
+/** While Discord shows playing, wake if content ticks go quiet (tab hidden / missed pause). */
+function armPlaybackStallAlarm(delayMs = PLAYBACK_STALL_MS) {
+  if (pageMode !== "watch") {
+    clearPlaybackStallAlarm();
+    return;
+  }
+  if (playbackData?.paused || lastSentPlayback?.paused) {
+    clearPlaybackStallAlarm();
+    return;
+  }
+  const when = Date.now() + Math.max(1000, Number(delayMs) || PLAYBACK_STALL_MS);
+  try {
+    chrome.alarms.create(ALARM_PLAYBACK_STALL, { when });
+  } catch {
+    chrome.alarms.create(ALARM_PLAYBACK_STALL, {
+      delayInMinutes: Math.max(0.05, (Number(delayMs) || PLAYBACK_STALL_MS) / 60_000)
+    });
+  }
+}
+
+/**
+ * Content sometimes fails to deliver pause (hidden tab cancelled watchdog).
+ * If Discord still thinks we're playing and ticks stalled, force paused.
+ */
+function maybeForceStallPause(reason = "stall") {
+  if (pageMode !== "watch" || !isSharingActive())
+    return false;
+  if (!hasValidPlayback(playbackData) && !hasValidPlayback(lastSentPlayback))
+    return false;
+  const localPaused = Boolean(playbackData?.paused);
+  const discordPlaying = hasValidPlayback(lastSentPlayback) && !lastSentPlayback.paused;
+  const quietFor = Date.now() - (lastPlaybackMsgAt || 0);
+  // Local already paused but Discord still playing — push again.
+  if (localPaused && discordPlaying) {
+    lastActivityKey = null;
+    flushPresence({ urgent: true, bypassGap: true });
+    clearPlaybackStallAlarm();
+    return true;
+  }
+  if (localPaused || !discordPlaying)
+    return false;
+  if (quietFor < PLAYBACK_STALL_MS)
+    return false;
+  const seed = hasValidPlayback(playbackData) ? playbackData : lastSentPlayback;
+  applyPlayback(activeTabId, {
+    currentTime: seed.currentTime,
+    duration: seed.duration,
+    paused: true,
+    source: seed.source || "strmcx",
+    kind: "pause",
+    force: true,
+    stallReason: reason
+  });
+  return true;
 }
 
 /** Event pages drop setTimeout — alarm is the reliable Discord POST kick. */
@@ -1775,6 +1847,7 @@ function applyPlayback(tabId, data) {
   }
 
   playbackData = next;
+  lastPlaybackMsgAt = Date.now();
   warmAuth();
 
   // Buffer ticks during browse→watch gap; push once presence exists.
@@ -1790,38 +1863,69 @@ function applyPlayback(tabId, data) {
     Number.isFinite(next.duration) &&
     next.duration > 1;
 
-  const forcePush = isPausePlay || explicitSeek || firstPlayback || Boolean(next.force);
-  if (!forcePush)
+  // Playing→paused (or the reverse) must always reach Discord — even when the
+  // content script sends a quiet tick without kind/force after a missed POST.
+  const discordPaused = Boolean(lastSentPlayback?.paused);
+  const pauseFlip = Boolean(next.paused) !== discordPaused && hasValidPlayback(lastSentPlayback);
+  const becomingPaused = Boolean(next.paused) && (!lastSentPlayback || !discordPaused);
+
+  const forcePush =
+    isPausePlay ||
+    explicitSeek ||
+    firstPlayback ||
+    Boolean(next.force) ||
+    pauseFlip ||
+    becomingPaused;
+  if (!forcePush) {
+    if (!next.paused)
+      armPlaybackStallAlarm();
+    else
+      clearPlaybackStallAlarm();
     return { ok: true, skipped: true };
+  }
 
   const actionKind = explicitSeek
     ? "seek"
     : kind === "hitch" || kind === "ended"
       ? "pause"
-      : (isPausePlay || firstPlayback || next.force)
+      : (isPausePlay || firstPlayback || next.force || becomingPaused)
         ? (kind || (next.paused ? "pause" : "play"))
         : next.paused
           ? "pause"
           : "play";
 
-  const shouldFlush = logYou(actionKind, next);
+  let shouldFlush = logYou(actionKind, next);
+  // Duplicate pause spam is fine to coalesce — unless Discord never got pause.
+  if (!shouldFlush && becomingPaused)
+    shouldFlush = true;
 
   if (Date.now() < rateLimitUntil) {
     if (firstPlayback)
       watchPlaybackFlushQueued = true;
     pushQueued = true;
     scheduleRateLimitRetry();
+    if (next.paused)
+      clearPlaybackStallAlarm();
+    else
+      armPlaybackStallAlarm();
     return { ok: true, rateLimited: true };
   }
 
-  if (!shouldFlush)
+  if (!shouldFlush) {
+    if (!next.paused)
+      armPlaybackStallAlarm();
     return { ok: true, coalesced: true };
+  }
 
   if (firstPlayback)
     watchPlaybackFlushQueued = true;
 
   lastActivityKey = null;
-  flushPresence({ urgent: true });
+  flushPresence({ urgent: true, bypassGap: becomingPaused || pauseFlip });
+  if (next.paused)
+    clearPlaybackStallAlarm();
+  else
+    armPlaybackStallAlarm();
   return { ok: true };
 }
 
@@ -1844,6 +1948,7 @@ function onBrowse(tabId, tick = false) {
   seekPin = null;
   lastMediaSource = "";
   lastMediaSourceAt = 0;
+  clearPlaybackStallAlarm();
   watchAwaitingPlayback = false;
   watchPlaybackFlushQueued = false;
   watchNavAllowTitleOnly = false;
@@ -2022,6 +2127,7 @@ async function clearPresenceState({ keepalive = false } = {}) {
   seekPin = null;
   lastMediaSource = "";
   lastMediaSourceAt = 0;
+  clearPlaybackStallAlarm();
   dotFrame = 0;
   armSessionKeepalive();
   persistPresenceState();
@@ -2078,7 +2184,8 @@ function scheduleRateLimitRetry() {
     if (pushQueued || pageMode === "watch") {
       pushQueued = false;
       lastActivityKey = null;
-      flushPresence({ urgent: true });
+      if (!maybeForceStallPause("rate-limit-retry"))
+        flushPresence({ urgent: true });
     }
   }, delay);
 }
@@ -2345,6 +2452,10 @@ async function pushPresence({ keepalive = false } = {}) {
         watchAwaitingPlayback = false;
         watchPlaybackFlushQueued = false;
         clearWatchPlaybackTimers();
+        if (snapPlayback.paused)
+          clearPlaybackStallAlarm();
+        else
+          armPlaybackStallAlarm();
       } else if (modeAtStart === "watch" && pendingUserAction?.kind === "nav") {
         // Title-only fallback — stop waiting so later ticks can update normally.
         watchAwaitingPlayback = false;

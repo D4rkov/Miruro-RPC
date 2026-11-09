@@ -555,6 +555,10 @@
   function onVisibility() {
     if (document.visibilityState === "hidden") {
       lastHiddenAt = Date.now();
+      // Keep the stall timer alive while the user checks Discord — background
+      // tabs often stop receiving strmcx ticks even when still "playing".
+      if (isWatchPage() && knownDuration && havePlaybackTime && lastPaused !== true)
+        armStrmcxWatchdog();
       // Desktop: keep RPC while flipping tabs. Phone: minimize / app-switch
       // must clear — beforeunload often never runs on Android.
       if (isAndroidUa()) {
@@ -697,23 +701,42 @@
     );
   }
 
-  // Capture pause/play when <video> is unreachable — click the control chrome.
+  // Capture pause/play when <video> is unreachable — click the control chrome
+  // or the player surface (many Miruro builds use icon-only controls).
   document.addEventListener("click", (event) => {
     if (!isWatchPage())
       return;
-    const t = event.target?.closest?.(
+    const control = event.target?.closest?.(
       "button, [role='button'], .plyr__control, [aria-label], [title]"
     );
-    if (!t)
-      return;
-    const label = `${t.getAttribute("aria-label") || ""} ${t.getAttribute("title") || ""} ${t.className || ""}`.toLowerCase();
-    if (/\bpause\b/.test(label) || t.getAttribute("data-plyr") === "pause") {
-      setTimeout(() => forcePauseFromUi("click-pause"), 30);
-      return;
+    if (control) {
+      const label = `${control.getAttribute("aria-label") || ""} ${control.getAttribute("title") || ""} ${control.className || ""}`.toLowerCase();
+      if (/\bpause\b/.test(label) || control.getAttribute("data-plyr") === "pause") {
+        setTimeout(() => forcePauseFromUi("click-pause"), 30);
+        return;
+      }
+      if (
+        (/\bplay\b/.test(label) && !/\bpause\b/.test(label)) ||
+        control.getAttribute("data-plyr") === "play"
+      ) {
+        setTimeout(() => forcePlayFromUi("click-play"), 30);
+        return;
+      }
     }
-    if (/\bplay\b/.test(label) && !/\bpause\b/.test(label) || t.getAttribute("data-plyr") === "play") {
-      setTimeout(() => forcePlayFromUi("click-play"), 30);
-    }
+    const onPlayer = event.target?.closest?.(
+      "strmcx-embed, video, .plyr, .plyr__video-wrapper, [class*='player'], [class*='Player']"
+    );
+    if (!onPlayer)
+      return;
+    // Generic player click — re-read DOM after the player toggles.
+    setTimeout(() => {
+      if (readDomPausedHint())
+        forcePauseFromUi("click-player");
+      else if (document.querySelector(".plyr--playing") || document.querySelector(
+        '[aria-label="Pause"], button[aria-label="Pause"], button[title="Pause"], .plyr__control[data-plyr="pause"]'
+      ))
+        forcePlayFromUi("click-player");
+    }, 80);
   }, true);
 
   document.addEventListener("keydown", (event) => {
@@ -892,30 +915,35 @@
     }
   }
 
+  function publishWatchdogPause(reason = "watchdog") {
+    if (!isWatchPage())
+      return;
+    if (stickyPaused && lastPaused === true)
+      return;
+    if (!havePlaybackTime || !knownDuration)
+      return;
+    // Heartbeat stopped ⇒ paused. Do NOT require tab focus — users often
+    // alt-tab to Discord to check RPC, which used to cancel this path.
+    strmcxResumeBeats = 0;
+    markStickyPaused();
+    ingestPlayback(
+      {
+        currentTime: lastPlaybackTime,
+        duration: knownDuration,
+        paused: true
+      },
+      "strmcx",
+      "pause"
+    );
+  }
+
   function armStrmcxWatchdog() {
     clearStrmcxWatchdog();
     if (!isWatchPage() || !knownDuration)
       return;
     strmcxWatchdogTimer = setTimeout(() => {
       strmcxWatchdogTimer = null;
-      if (!isWatchPage() || !isFocused())
-        return;
-      if (stickyPaused || lastPaused === true)
-        return;
-      if (!havePlaybackTime || !knownDuration)
-        return;
-      // Heartbeat stopped for real ⇒ user paused.
-      strmcxResumeBeats = 0;
-      markStickyPaused();
-      ingestPlayback(
-        {
-          currentTime: lastPlaybackTime,
-          duration: knownDuration,
-          paused: true
-        },
-        "strmcx",
-        "pause"
-      );
+      publishWatchdogPause("strmcx-gap");
     }, STRMCX_PAUSE_GAP_MS);
   }
 
@@ -1097,8 +1125,21 @@
   }
 
   function pollPlayback() {
-    if (!isFocused() || !isWatchPage())
+    if (!isWatchPage())
       return;
+
+    // Hidden tab: still detect pause from a stalled clock (strmcx stops ticking).
+    if (!isFocused()) {
+      if (
+        knownDuration &&
+        havePlaybackTime &&
+        lastPaused !== true &&
+        Date.now() - lastAdvanceAt >= STRMCX_PAUSE_GAP_MS
+      ) {
+        publishWatchdogPause("hidden-stall");
+      }
+      return;
+    }
 
     attachStrmcx(document.querySelector("strmcx-embed"));
 
