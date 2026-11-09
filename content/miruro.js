@@ -104,8 +104,38 @@
     return value;
   }
 
+  /** Show name only — season/episode chrome belongs on Discord's SxEy badge. */
+  function scrubAnimeTitle(text) {
+    let value = cleanText(text);
+    if (!value)
+      return null;
+    value = value
+      .replace(/^Watch\s+/i, "")
+      .replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
+      .replace(/\s*[|\-–—·•]\s*Season\s+\d+\b.*$/i, "")
+      .replace(/\s+Season\s+\d+(?:\s*[:\-–—]?\s*(?:Episode|Ep\.?)\s*\d+)?\s*$/i, "")
+      .replace(/\s*\((?:Season|S)\s*\d+[^)]*\)\s*$/i, "")
+      .replace(/\s*\[(?:Season|S)\s*\d+[^\]]*\]\s*$/i, "")
+      .replace(/\s*[|\-–—·•]\s*S\d{1,2}(?:\s*E\d{1,4})?\b.*$/i, "")
+      .replace(/\s+S\d{1,2}(?:\s*E\d{1,4})?\s*$/i, "")
+      .replace(/\s*[|\-–—·•]\s*(?:Episode|Ep\.?)\s*\d+\b.*$/i, "")
+      .replace(/\s+(?:Episode|Ep\.?)\s*\d+\b.*$/i, "")
+      .replace(/[\s|\-–—·•]+$/g, "")
+      .trim();
+    if (!value || isJunkTitle(value) || isEpisodeHeading(value))
+      return null;
+    if (/^(?:Season\s+\d+|S\d{1,2}(?:E\d{1,4})?)$/i.test(value))
+      return null;
+    return value;
+  }
+
   function collectTitleCandidates() {
     const candidates = [];
+    const push = (raw, score) => {
+      const text = scrubAnimeTitle(raw);
+      if (text && text.length < 120)
+        candidates.push({ text, score });
+    };
 
     for (const sel of [
       "h1.anime-title",
@@ -116,18 +146,12 @@
       '[class*="infoDesktopTitle"]',
       '[class*="infoMobileTitle"]'
     ]) {
-      for (const node of document.querySelectorAll(sel)) {
-        const text = cleanText(node.textContent);
-        if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
-          candidates.push({ text, score: 120 });
-      }
+      for (const node of document.querySelectorAll(sel))
+        push(node.textContent, 120);
     }
 
-    for (const node of document.querySelectorAll(".watch-controls h2")) {
-      const text = cleanText(node.textContent);
-      if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
-        candidates.push({ text, score: 110 });
-    }
+    for (const node of document.querySelectorAll(".watch-controls h2"))
+      push(node.textContent, 110);
 
     const cover = document.querySelector(
       'img[class*="_coverImg_"], img[class*="coverImg"], img[class*="_cover"]'
@@ -135,9 +159,7 @@
     if (cover) {
       const card = cover.closest("div, article, section, aside") || cover.parentElement;
       const heading = card?.querySelector("a[href*='/info/'], h1.anime-title, .anime-title, h2");
-      const text = cleanText(heading?.textContent);
-      if (text && !isJunkTitle(text) && !isEpisodeHeading(text))
-        candidates.push({ text, score: 100 });
+      push(heading?.textContent, 100);
     }
 
     // Only watch-panel / cover-card info links — never sidebar recommendations
@@ -148,26 +170,13 @@
       if (link.closest('[class*="sideList"], [class*="SideList"], aside, [class*="recommend"], [class*="trending"]'))
         continue;
       const aria = cleanText(link.getAttribute("aria-label") || "").replace(/^About\s+/i, "");
-      const text = cleanText(link.textContent) || aria;
-      if (text && !isJunkTitle(text) && !isEpisodeHeading(text) && text.length < 120)
-        candidates.push({ text, score: 40 });
+      push(link.textContent || aria, 40);
     }
 
-    for (const og of metaContents("og:title")) {
-      const fromOg = cleanText(
-        og.replace(/^Watch\s+/i, "").replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
-      );
-      if (fromOg && !isJunkTitle(fromOg) && !isEpisodeHeading(fromOg))
-        candidates.push({ text: fromOg, score: 30 });
-    }
+    for (const og of metaContents("og:title"))
+      push(og, 30);
 
-    const tab = cleanText(document.title)
-      .replace(/^Watch\s+/i, "")
-      .replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
-      .replace(/\s+Episode\s+\d+.*$/i, "")
-      .trim();
-    if (tab && !isJunkTitle(tab) && !isEpisodeHeading(tab))
-      candidates.push({ text: tab, score: 5 });
+    push(document.title, 5);
 
     candidates.sort((a, b) => b.score - a.score || a.text.length - b.text.length);
     return candidates;
@@ -269,6 +278,34 @@
 
     const heading = getEpisodeHeadingText();
     return parseEpisodeNumber(heading) || 1;
+  }
+
+  /** Best-effort season for Discord's SxEy badge. Defaults to 1 when unknown. */
+  function getSeason() {
+    const params = new URL(location.href).searchParams;
+    for (const key of ["season", "s", "sn"]) {
+      const n = Number(params.get(key));
+      if (Number.isFinite(n) && n > 0)
+        return n;
+    }
+
+    const blobs = [
+      document.querySelector("[class*='season'], [data-season]")?.textContent,
+      getEpisodeHeadingText(),
+      document.querySelector("h1")?.textContent
+    ];
+    for (const raw of blobs) {
+      const text = cleanText(raw);
+      if (!text)
+        continue;
+      const sxe = text.match(/\bS(\d+)\s*E(\d+)\b/i);
+      if (sxe)
+        return Number(sxe[1]) || 1;
+      const named = text.match(/\bSeason\s+(\d+)\b/i);
+      if (named)
+        return Number(named[1]) || 1;
+    }
+    return 1;
   }
 
   function getEpisodeHeadingText() {
@@ -421,11 +458,13 @@
       return;
 
     const episode = getEpisode();
+    const season = getSeason();
     const titles = getTitleAlts();
     const anilistId = getAnilistId();
     const payload = {
       title,
       titles,
+      season,
       episode,
       episodeTitle: getEpisodeTitle(episode),
       cover: getCover(),

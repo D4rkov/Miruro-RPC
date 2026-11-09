@@ -1376,6 +1376,7 @@ function presenceMetaKey(data) {
   // show switch (that wiped playback and froze Discord at 00:00).
   return JSON.stringify({
     title: String(data.title || "").trim().toLowerCase(),
+    season: Number(data.season) || 1,
     episode: Number(data.episode) || 0
   });
 }
@@ -2628,12 +2629,12 @@ function isAwkwardEnglishTrunc(trunc) {
 
 /** Short label for Discord `name` only — full title stays in `details`. */
 function shortTitleForWatchName(fullTitle, extraTitles = []) {
-  const full = sanitizePresenceText(fullTitle, 128);
+  const full = sanitizeAnimeTitle(fullTitle, 128);
   if (!full)
     return "";
   const max = nameTitleMax();
   const localVariants = heuristicTitleVariants(full)
-    .map((t) => sanitizePresenceText(t, 128))
+    .map((t) => sanitizeAnimeTitle(t, 128))
     .filter((t) => t && !isWeakShortTitle(t, full));
   const localLatinFit = localVariants
     .filter((t) => t.length <= max && isLatinShortTitle(t) && !isAwkwardEnglishTrunc(t))
@@ -2645,7 +2646,7 @@ function shortTitleForWatchName(fullTitle, extraTitles = []) {
   const seen = new Set();
   const push = (value) => {
     for (const variant of heuristicTitleVariants(value)) {
-      const clean = sanitizePresenceText(variant, 128);
+      const clean = sanitizeAnimeTitle(variant, 128);
       const key = normalizeTitleKey(clean);
       if (!clean || !key || seen.has(key))
         continue;
@@ -2850,24 +2851,35 @@ async function enrichWatchTitlesFromAnilist(presence, { flush = true } = {}) {
   return true;
 }
 
+/** Discord Watching badge: large_text "Season X, Episode Y" → SxEy chip. */
+function watchSeasonEpisode(presence) {
+  const episode = Math.max(1, Math.floor(Number(presence?.episode) || 1));
+  const season = Math.max(1, Math.floor(Number(presence?.season) || 1));
+  return { season, episode };
+}
+
+function watchLargeTextBadge(presence) {
+  const { season, episode } = watchSeasonEpisode(presence);
+  return `Season ${season}, Episode ${episode}`;
+}
+
+function watchActivityState(presence) {
+  const { episode } = watchSeasonEpisode(presence);
+  const epTitle = sanitizePresenceText(presence?.episodeTitle, 128);
+  // Episode title alone — SxEy lives on the large_text badge now.
+  if (epTitle)
+    return epTitle;
+  return `Episode ${episode}`;
+}
+
 function buildWatchActivity(presence, playback) {
   if (!presence?.title)
     return null;
 
-  const details = sanitizePresenceText(presence.title, 128);
+  const details = sanitizeAnimeTitle(presence.title, 128);
   if (!details)
     return null;
-  const episode = presence.episode || 1;
-  let state = `EP. ${episode}`;
-
-  if (presence.episodeTitle) {
-    const prefix = `${state}: "`;
-    const suffix = `"`;
-    const max = 128 - prefix.length - suffix.length;
-    const epTitle = sanitizePresenceText(presence.episodeTitle, Math.max(0, max));
-    if (epTitle)
-      state = `${prefix}${epTitle}${suffix}`;
-  }
+  const state = watchActivityState(presence);
 
   const url = sanitizeWatchUrl(presence.url);
   const brandImage = ACTIVITY.assetUrl || ACTIVITY.assetId;
@@ -2888,7 +2900,8 @@ function buildWatchActivity(presence, playback) {
     supported_platforms: ["desktop", "android", "ios"],
     assets: {
       large_image: largeImage,
-      large_text: details.slice(0, 128),
+      // Must stay "Season N, Episode M" — Discord turns it into the S1E12 badge.
+      large_text: watchLargeTextBadge(presence),
       large_url: url || undefined,
       small_image: paused ? pauseImage : playImage,
       small_text: paused ? "Paused" : "Playing"
@@ -2946,6 +2959,29 @@ function sanitizePresenceText(value, max = 128) {
     .slice(0, max);
 }
 
+/** Anime name for details/name — strip Season/S1/Episode chrome (badge owns that). */
+function sanitizeAnimeTitle(value, max = 128) {
+  let text = sanitizePresenceText(value, 256);
+  if (!text)
+    return "";
+  text = text
+    .replace(/^Watch\s+/i, "")
+    .replace(/\s*[|\-–—]\s*Miruro.*$/i, "")
+    .replace(/\s*[|\-–—·•]\s*Season\s+\d+\b.*$/i, "")
+    .replace(/\s+Season\s+\d+(?:\s*[:\-–—]?\s*(?:Episode|Ep\.?)\s*\d+)?\s*$/i, "")
+    .replace(/\s*\((?:Season|S)\s*\d+[^)]*\)\s*$/i, "")
+    .replace(/\s*\[(?:Season|S)\s*\d+[^\]]*\]\s*$/i, "")
+    .replace(/\s*[|\-–—·•]\s*S\d{1,2}(?:\s*E\d{1,4})?\b.*$/i, "")
+    .replace(/\s+S\d{1,2}(?:\s*E\d{1,4})?\s*$/i, "")
+    .replace(/\s*[|\-–—·•]\s*(?:Episode|Ep\.?)\s*\d+\b.*$/i, "")
+    .replace(/\s+(?:Episode|Ep\.?)\s*\d+\b.*$/i, "")
+    .replace(/[\s|\-–—·•]+$/g, "")
+    .trim();
+  if (/^(?:Season\s+\d+|S\d{1,2}(?:E\d{1,4})?)$/i.test(text))
+    return "";
+  return sanitizePresenceText(text, max);
+}
+
 function sanitizeCover(cover) {
   if (!cover || typeof cover !== "string")
     return null;
@@ -2997,6 +3033,7 @@ function activityKey(activity, playback = null) {
     state: activity?.state,
     type: activity?.type,
     image: activity?.assets?.large_image,
+    largeText: activity?.assets?.large_text,
     small: activity?.assets?.small_image,
     progress
   });
@@ -3089,19 +3126,10 @@ async function upsertHeadlessSession(accessToken, activity, token, { retriedAuth
 
 /** Strip optional fields Discord sometimes rejects on mobile. */
 function buildMinimalWatchActivity(presence, playback = null) {
-  const details = sanitizePresenceText(presence?.title, 128);
+  const details = sanitizeAnimeTitle(presence?.title, 128);
   if (!details)
     return null;
-  const episode = presence?.episode || 1;
-  let state = `EP. ${episode}`;
-  if (presence?.episodeTitle) {
-    const prefix = `${state}: "`;
-    const suffix = `"`;
-    const max = 128 - prefix.length - suffix.length;
-    const epTitle = sanitizePresenceText(presence.episodeTitle, Math.max(0, max));
-    if (epTitle)
-      state = `${prefix}${epTitle}${suffix}`;
-  }
+  const state = watchActivityState(presence);
   const cover = sanitizeCover(presence?.cover);
   const media = hasValidPlayback(playback) ? playback : seedPlaybackFromPresence(presence);
   const now = Date.now();
@@ -3123,7 +3151,7 @@ function buildMinimalWatchActivity(presence, playback = null) {
     supported_platforms: ["desktop", "android", "ios"],
     assets: {
       large_image: cover || ACTIVITY.assetUrl || ACTIVITY.assetId,
-      large_text: details.slice(0, 128)
+      large_text: watchLargeTextBadge(presence)
     },
     timestamps
   };
