@@ -449,8 +449,11 @@
     return null;
   }
 
-  function sendPresence(playback = null) {
-    if (!isFocused() || !isWatchPage())
+  function sendPresence(playback = null, opts = {}) {
+    if (!isWatchPage())
+      return;
+    // Periodic refreshes stay focused-only; claim/wait may send while blurred.
+    if (!opts.allowHidden && !isFocused())
       return;
 
     const title = getTitle();
@@ -499,7 +502,10 @@
 
     const attempt = () => {
       presenceWaitTimer = null;
-      if (!isFocused() || !isWatchPage())
+      // Left the watch route — stop. Blur/focus alone must NOT cancel: users
+      // often alt-tab to Discord while the title scrape is still waking up,
+      // which used to abort forever and leave RPC stuck on browse.
+      if (!isWatchPage())
         return;
       if (getWatchKey() !== expectedKey)
         return;
@@ -507,13 +513,19 @@
       const title = getTitle();
       const cover = getCover();
       const timedOut = Date.now() - startedAt >= 2500;
+      const hardTimedOut = Date.now() - startedAt >= 8000;
       const titleReady = title && !isJunkTitle(title) && title !== previousTitle;
       const coverReady = cover && cover !== previousCover;
       const firstPaint = !previousTitle && title && !isJunkTitle(title);
       const episodeOnlyReady = sameShow && title && !isJunkTitle(title);
 
       if (firstPaint || titleReady || coverReady || episodeOnlyReady || (timedOut && title && !isJunkTitle(title))) {
-        sendPresence();
+        sendPresence(null, { allowHidden: true });
+        return;
+      }
+      if (hardTimedOut) {
+        // Last resort — still poke background so watch mode isn't silent.
+        sendPresence(null, { allowHidden: true });
         return;
       }
       presenceWaitTimer = setTimeout(attempt, 150);
@@ -556,10 +568,9 @@
   }
 
   function claim() {
-    if (!isFocused())
-      return;
-
     if (!isWatchPage()) {
+      if (!isFocused())
+        return;
       cancelPresenceWait();
       activeWatchKey = null;
       startBrowseTicker();
@@ -567,9 +578,12 @@
       return;
     }
 
+    // Watch claim even if blurred — otherwise browse stays on Discord forever
+    // when the user opens an episode then checks Discord before the scrape lands.
     stopBrowseTicker();
     sendBg({ type: "claim", mode: "watch" });
     schedulePresenceWhenReady(null, null);
+    sendPresence(null, { allowHidden: true });
     // Don't wait on the iframe poll — tab focus must refresh RPC immediately.
     pulsePlayback();
     setTimeout(pulsePlayback, 200);
@@ -581,8 +595,8 @@
     if (message?.type !== "resync")
       return;
     claim();
-    if (isFocused() && isWatchPage()) {
-      sendPresence();
+    if (isWatchPage()) {
+      sendPresence(null, { allowHidden: true });
       pulsePlayback();
     }
   });

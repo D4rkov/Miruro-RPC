@@ -348,8 +348,12 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     if (pageMode === "idle" || !isSharingActive())
       return;
     if (pageMode === "watch") {
-      if (!presenceData?.title)
+      if (!presenceData?.title) {
+        // Still waiting on scrape — poke the tab, don't fall through to browse.
+        nudgeMiruroTab(activeTabId);
+        armWatchFlushAlarm(1500);
         return;
+      }
       if (!isTrustedMedia(playbackData))
         watchNavAllowTitleOnly = true;
       watchAwaitingPlayback = false;
@@ -678,13 +682,31 @@ async function handleMessage(message, sender) {
         clearTimeout(flushDebounceTimer);
         flushDebounceTimer = null;
       }
+      if (pushTimer) {
+        clearTimeout(pushTimer);
+        pushTimer = null;
+      }
+      if (rateLimitRetryTimer) {
+        clearTimeout(rateLimitRetryTimer);
+        rateLimitRetryTimer = null;
+      }
+      clearWatchPlaybackTimers();
+      clearPlaybackStallAlarm();
+      try {
+        chrome.alarms.clear(ALARM_PRESENCE_FLUSH);
+        chrome.alarms.clear(ALARM_WATCH_FLUSH);
+      } catch { /* ignore */ }
       pushQueued = false;
+      pendingUserAction = null;
       pageMode = "idle";
       presenceData = null;
       playbackData = null;
+      lastSentPlayback = null;
+      browseStart = null;
       activeTabId = null;
       lastActivityKey = null;
-      presenceSuppressedUntil = Date.now() + 8000;
+      // Long enough that a live Miruro tab can't instantly rebuild browse/watch.
+      presenceSuppressedUntil = Date.now() + 15000;
       logYouNav("clear stuck RPC");
       const result = await forceClearHeadlessPresence(access, { requireToken: true });
       const ok = Boolean(result?.ok);
@@ -697,6 +719,9 @@ async function handleMessage(message, sender) {
         forAction: "clear stuck RPC",
         error: result?.error || null
       });
+      try {
+        await chrome.storage.local.set({ [STORAGE_KEYS.presenceState]: null });
+      } catch { /* ignore */ }
       persistPresenceState();
       setBadge(tokens?.access_token ? (presenceEnabled ? "on" : "paused") : "off");
       return {
@@ -1362,9 +1387,19 @@ function onClaim(tabId, mode) {
     clearTimeout(browseFlushTimer);
     browseFlushTimer = null;
   }
-  // Watch claim: stay on current presence (usually previous watch) until presence arrives.
+  // Flip to watch immediately so flush/keepalive alarms cannot re-POST browse
+  // while we're waiting for the title scrape (that left Discord stuck on browse).
+  if (pageMode !== "watch") {
+    pageMode = "watch";
+    browseStart = null;
+    watchAwaitingPlayback = true;
+    watchPlaybackFlushQueued = false;
+    watchNavAllowTitleOnly = false;
+  }
+  // Watch claim: stay on current Discord card until presence arrives.
   // Alarm backup — if the follow-up presence message is lost on a cold SW, still kick.
   armWatchFlushAlarm(1500);
+  nudgeMiruroTab(tabId);
   persistPresenceState();
   return { ok: true };
 }
@@ -1938,6 +1973,9 @@ const BROWSE_AFTER_WATCH_MS = 1000;
 function onBrowse(tabId, tick = false) {
   if (tabId == null)
     return { ok: false };
+  // Ignore stale browse ticks after a watch claim — those re-stuck Discord on browse.
+  if (tick && pageMode === "watch" && tabId === activeTabId)
+    return { ok: true, ignored: "watch-active" };
   activeTabId = tabId;
   const fromIdle = pageMode === "idle";
   const fromWatch = pageMode === "watch";
